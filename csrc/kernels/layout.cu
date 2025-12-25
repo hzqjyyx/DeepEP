@@ -23,9 +23,9 @@ __global__ void get_dispatch_layout(const topk_idx_t* topk_idx,  // [num_tokens,
                                     int* num_tokens_per_expert,  // [num_experts] 每个 expert 收到的 token 数
                                     bool* is_token_in_rank,  // [num_tokens, num_ranks] token i 是否被发送到 rank j
                                     int num_tokens,  // 总 token 数
-                                    int num_topk,  // 每个 token 选中的 expert 数（通常是 2）
-                                    int num_ranks,  // 总 rank 数
-                                    int num_experts) {  // 总 expert 数
+                                    int num_topk,  // 每个 token 选中的 expert 数（通常是 8）
+                                    int num_ranks,  // 总 rank 数，一般为 8～32
+                                    int num_experts) {  // 总 expert 数，DeepSeek 为 256
     auto sm_id = static_cast<int>(blockIdx.x);  // block ID（前段统计 expert，后段统计 rank）
     auto thread_id = static_cast<int>(threadIdx.x);  // 线程 ID（0 到 kNumThreads-1）
 
@@ -41,8 +41,8 @@ __global__ void get_dispatch_layout(const topk_idx_t* topk_idx,  // [num_tokens,
         #pragma unroll
         for (int i = 0; i < kNumExpertsPerSM; ++i)
             num_tokens_per_expert_per_thread[thread_id][i] = 0;
-        // 每个线程 stride 访问所有 token，统计落在本 block 负责范围内的 expert
-        // 同一 warp 内连续线程访问连续地址，保证 memory coalescing
+
+        // 每个线程 stride 访问所有 token，统计在所有 token 中落在本 block 负责范围内的 expert
         #pragma unroll
         for (int i = thread_id; i < num_tokens; i += kNumThreads) {
             auto shifted_topk_idx = topk_idx + i * num_topk;  // 定位到 token i 的 topk expert 列表起始位置
@@ -98,7 +98,7 @@ __global__ void get_dispatch_layout(const topk_idx_t* topk_idx,  // [num_tokens,
         #pragma unroll
         for (int i = 0; i < kNumRDMARanksPerSM; ++i)
             num_tokens_per_rdma_rank_per_thread[thread_id][i] = 0;
-        // 每个线程 stride 访问所有 token
+
         #pragma unroll
         for (int i = thread_id; i < num_tokens; i += kNumThreads) {
             auto shifted_topk_idx = topk_idx + i * num_topk;  // 定位到 token i 的 topk expert 列表起始位置
@@ -113,7 +113,7 @@ __global__ void get_dispatch_layout(const topk_idx_t* topk_idx,  // [num_tokens,
                 }
             }
 
-            // 写入 is_token_in_rank（bool 数组，标记 token i 是否被发送到 rank j）
+            // 写入 is_token_in_rank （bool 数组，标记 token i 是否被发送到 rank j）
             auto shifted_is_token_in_rank = is_token_in_rank + i * num_ranks;  // 定位到 token i 对应的 rank 列表起始位置
             #pragma unroll
             for (int j = 0; j + rank_begin_idx < rank_end_idx; ++j) {

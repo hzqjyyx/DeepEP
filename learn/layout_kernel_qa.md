@@ -138,3 +138,21 @@ __shared__ int num_tokens_per_rdma_rank_per_thread[256][1]; // 1KB
 - ✅ 逻辑清晰，避免复杂的条件分支
 - ✅ Shared memory 利用率高
 - ✅ 并行度可以独立优化
+
+## Q3: get_dispatch_layout的实现在前段 SM 中没有做合并访存，也可以模版化 num_topk，有没有收益呢？
+
+合并访存的版本：
+```cuda
+for (int i = thread_id; i < num_tokens * num_topk; i += kNumThreads) {         
+    int token_id = i / num_topk;                                               
+    int topk_id = i % num_topk;      
+    auto shifted_topk_idx = topk_idx + token_id * num_topk;                                          
+    if (token_id < num_tokens){
+        expert_idx = static_cast<int>(shifted_topk_idx[topk_id]);
+        if (expert_begin_idx <= expert_idx and expert_idx < expert_end_idx)
+            ++num_tokens_per_expert_per_thread[thread_id][expert_idx - expert_begin_idx];
+    }                                             
+}
+```
+
+TBD

@@ -1,0 +1,72 @@
+# xraypo 配置示例
+
+# 源代码目录
+source: ./aten/src/ATen
+
+# 输出目录
+target: ./learn/aten
+
+# 工作目录（可选），用于计算相对路径引用
+# source 必须在 base_dir 之下
+# 如果不指定，默认使用 source 目录
+base_dir: ./
+
+# HTTPS 代理（可选）
+https_proxy: http://123.206.229.164:25673
+
+# 要执行的任务列表
+tasks:
+  - purpose
+  # - pseudocode
+  # - folder_summary
+
+# 最大并发数
+max_workers: 3
+
+# 排除规则（gitignore 格式）
+exclude_patterns:
+  - "*.pyc"
+  - "__pycache__"
+  - "node_modules"
+  - "*.min.js"
+  - "ao_sparse"
+  - "cpu"
+  - "hip"
+  - "kleidiai"
+  - "metal"
+  - "miopen"
+  - "mkl"
+  - "mkldnn"
+  - "mps"
+  - "sparse"
+  - "ufunc"
+  - "vulkan"
+  - "xnnpack"
+  - "test"
+  - "mobile"
+
+# 模型选择配置
+model_selection:
+  # 默认模型
+  default: tier3
+
+  # token 阈值，超过该阈值使用更强模型
+  token_thresholds:
+    tier1: 30000000  # >30000000 tokens 用 tier1 (opus)
+    tier2: 3000   # >3000 tokens 用 tier2 (sonnet)
+
+  # 路径匹配覆盖，匹配的文件使用指定模型
+  path_overrides:
+    tier1:
+      - "**/main.*"
+
+  # 任务类型覆盖
+  task_overrides:
+    pseudocode: tier2
+    folder_summary: tier2
+
+# 模型名称映射
+models:
+  tier1: opus
+  tier2: sonnet
+  tier3: haiku
