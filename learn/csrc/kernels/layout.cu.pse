@@ -1,0 +1,179 @@
+--------------------------------
+get_dispatch_layout (device kernel)
+来源: csrc/kernels/layout.cu
+--------------------------------
+
+【签名】
+    @device
+    get_dispatch_layout<kNumThreads=256, kNumExpertsPerSM=4, kNumRanksPerSM=8>(
+        topk_idx: Tensor[num_tokens, num_topk, topk_idx_t],
+        num_tokens_per_rank: Tensor[num_ranks, int],              # 输出：每个rank收到的token数
+        num_tokens_per_rdma_rank: Tensor[num_rdma_ranks, int],    # 输出（可选）：每个rdma_rank收到的token数
+        num_tokens_per_expert: Tensor[num_experts, int],          # 输出：每个expert收到的token数
+        is_token_in_rank: Tensor[num_tokens, num_ranks, bool],    # 输出：token i是否被发送到rank j
+        num_tokens: int,
+        num_topk: int,
+        num_ranks: int,
+        num_experts: int
+    )
+
+    约束:
+    - num_experts通常为256（DeepSeek配置）
+    - num_topk通常为8
+    - num_ranks通常为8～32
+    - 如果num_tokens_per_rdma_rank != nullptr，则 num_ranks % NUM_MAX_NVL_PEERS == 0 且 num_ranks > NUM_MAX_NVL_PEERS
+    - NUM_MAX_NVL_PEERS = 8（NVLink节点内最大peer数）
+
+【算法】
+    sm_id = blockIdx.x
+    thread_id = threadIdx.x
+
+    # ========== Part 1: 前段block统计expert ==========
+    expert_begin_idx = sm_id * kNumExpertsPerSM
+    expert_end_idx = min(expert_begin_idx + kNumExpertsPerSM, num_experts)
+    
+    if expert_begin_idx < expert_end_idx:
+        # 线程级计数器（shared memory，避免全局atomic contention）
+        shared num_tokens_per_expert_per_thread[kNumThreads][kNumExpertsPerSM]
+        
+        # 初始化
+        for i in range(kNumExpertsPerSM):
+            num_tokens_per_expert_per_thread[thread_id][i] = 0
+        
+        # 每个线程stride访问所有token
+        for token_id in range(thread_id, num_tokens, step=kNumThreads):
+            for j in range(num_topk):
+                expert_idx = topk_idx[token_id, j]
+                if expert_begin_idx <= expert_idx < expert_end_idx:
+                    local_expert_idx = expert_idx - expert_begin_idx
+                    num_tokens_per_expert_per_thread[thread_id][local_expert_idx] += 1
+        
+        __syncthreads()
+        
+        # Reduce：每个expert一个线程负责归约
+        if expert_begin_idx + thread_id < expert_end_idx:
+            sum = 0
+            for i in range(kNumThreads):
+                sum += num_tokens_per_expert_per_thread[i][thread_id]
+            num_tokens_per_expert[expert_begin_idx + thread_id] = sum
+        
+        return  # 前段block完成任务
+
+    # ========== Part 2: 后段block统计rank ==========
+    sm_begin = ceil(num_experts / kNumExpertsPerSM)  # 前段block数量
+    rank_begin_idx = (sm_id - sm_begin) * kNumRanksPerSM
+    rank_end_idx = min(rank_begin_idx + kNumRanksPerSM, num_ranks)
+    
+    if rank_begin_idx < rank_end_idx:
+        num_expert_per_rank = num_experts / num_ranks
+        expert_begin = rank_begin_idx * num_expert_per_rank
+        expert_end = rank_end_idx * num_expert_per_rank
+        
+        rdma_rank_begin_idx = rank_begin_idx / NUM_MAX_NVL_PEERS
+        rdma_rank_end_idx = rank_end_idx / NUM_MAX_NVL_PEERS
+        kNumRDMARanksPerSM = kNumRanksPerSM / NUM_MAX_NVL_PEERS
+        
+        # 线程级计数器
+        shared num_tokens_per_rank_per_thread[kNumThreads][kNumRanksPerSM]
+        shared num_tokens_per_rdma_rank_per_thread[kNumThreads][kNumRDMARanksPerSM]
+        
+        # 初始化
+        for i in range(kNumRanksPerSM):
+            num_tokens_per_rank_per_thread[thread_id][i] = 0
+        for i in range(kNumRDMARanksPerSM):
+            num_tokens_per_rdma_rank_per_thread[thread_id][i] = 0
+        
+        # 统计每个token的rank/rdma_rank分布（去重）
+        for token_id in range(thread_id, num_tokens, step=kNumThreads):
+            is_in_rank[kNumRanksPerSM] = {0}          # 当前token是否在各rank中（去重用）
+            is_in_rdma_rank[kNumRDMARanksPerSM] = {0}
+            
+            for j in range(num_topk):
+                expert_idx = topk_idx[token_id, j]
+                if expert_begin <= expert_idx < expert_end:
+                    rank_idx = expert_idx / num_expert_per_rank - rank_begin_idx
+                    is_in_rank[rank_idx] += 1
+                    is_in_rdma_rank[rank_idx / NUM_MAX_NVL_PEERS] += 1
+            
+            # 写入is_token_in_rank（bool标记）
+            for j in range(rank_end_idx - rank_begin_idx):
+                is_token_in_rank[token_id, rank_begin_idx + j] = (is_in_rank[j] > 0)
+                num_tokens_per_rank_per_thread[thread_id][j] += (is_in_rank[j] > 0)
+            
+            # 累加rdma_rank计数（去重）
+            for j in range(rdma_rank_end_idx - rdma_rank_begin_idx):
+                num_tokens_per_rdma_rank_per_thread[thread_id][j] += (is_in_rdma_rank[j] > 0)
+        
+        __syncthreads()
+        
+        # Reduce rank统计
+        if rank_begin_idx + thread_id < rank_end_idx:
+            sum = 0
+            for i in range(kNumThreads):
+                sum += num_tokens_per_rank_per_thread[i][thread_id]
+            num_tokens_per_rank[rank_begin_idx + thread_id] = sum
+        
+        # Reduce rdma_rank统计（可选）
+        if num_tokens_per_rdma_rank != nullptr and rdma_rank_begin_idx + thread_id < rdma_rank_end_idx:
+            sum = 0
+            for i in range(kNumThreads):
+                sum += num_tokens_per_rdma_rank_per_thread[i][thread_id]
+            num_tokens_per_rdma_rank[rdma_rank_begin_idx + thread_id] = sum
+
+【并行模式】
+    grid: (num_expert_blocks + num_rank_blocks,)
+        - num_expert_blocks = ceil(num_experts / kNumExpertsPerSM)
+        - num_rank_blocks = ceil(num_ranks / kNumRanksPerSM)
+    block: (kNumThreads=256,)
+    
+    - 前段block（sm_id < num_expert_blocks）：每个block统计kNumExpertsPerSM个expert
+    - 后段block（sm_id >= num_expert_blocks）：每个block统计kNumRanksPerSM个rank
+    
+    优化策略：
+    - shared memory存储线程级计数器，避免全局atomic contention
+    - stride访问模式（thread_id, thread_id+kNumThreads, ...）提高coalescing
+    - block_reduce：每个expert/rank一个线程负责归约
+
+【备注】
+    - 核心优化：将全局atomic add转换为shared memory + reduce，减少竞争
+    - 去重逻辑：每个token对每个rank/rdma_rank最多计数1次（is_in_rank/is_in_rdma_rank数组）
+    - rdma_rank：NUM_MAX_NVL_PEERS个rank合并为1个rdma_rank（用于internode RDMA通信）
+    - kNumRanksPerSM必须是NUM_MAX_NVL_PEERS的倍数（编译期检查）
+
+--------------------------------
+get_dispatch_layout (host API)
+来源: csrc/kernels/layout.cu
+--------------------------------
+
+【签名】
+    @host→device
+    get_dispatch_layout(
+        topk_idx: Tensor[num_tokens, num_topk, topk_idx_t],
+        num_tokens_per_rank: Tensor[num_ranks, int],
+        num_tokens_per_rdma_rank: Tensor[num_rdma_ranks, int] | nullptr,
+        num_tokens_per_expert: Tensor[num_experts, int],
+        is_token_in_rank: Tensor[num_tokens, num_ranks, bool],
+        num_tokens: int,
+        num_topk: int,
+        num_ranks: int,
+        num_experts: int,
+        stream: cudaStream_t
+    )
+
+【算法】
+    kNumThreads = 256
+    kNumExpertsPerSM = 4
+    kNumRanksPerSM = 8
+    
+    num_sms = ceil(num_experts / kNumExpertsPerSM) + ceil(num_ranks / kNumRanksPerSM)
+    
+    SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream)
+    LAUNCH_KERNEL(&cfg, 
+                  get_dispatch_layout<kNumThreads, kNumExpertsPerSM, kNumRanksPerSM>,
+                  topk_idx, num_tokens_per_rank, num_tokens_per_rdma_rank,
+                  num_tokens_per_expert, is_token_in_rank,
+                  num_tokens, num_topk, num_ranks, num_experts)
+
+【备注】
+    - 调优参数：kNumThreads=256, kNumExpertsPerSM=4, kNumRanksPerSM=8（针对DeepSeek内部集群优化）
+    - SETUP_LAUNCH_CONFIG/LAUNCH_KERNEL：见kernels/launch.cuh

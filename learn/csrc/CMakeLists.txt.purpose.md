@@ -1,0 +1,8 @@
+- **项目配置**：定义 CUDA 和 C++ 项目 `deep_ep`，设置编译标准为 C++17 和 CUDA 17
+- **编译优化**：启用 O3 优化、分离编译（SEPARABLE_COMPILATION）、详细调试标志
+- **NVCC 编译选项**：启用快速调试、指定 SM9.0（Hopper）架构、设置 PTX 优化和寄存器使用监控
+- **依赖查找**：定位 CUDA Toolkit、PyBind11、PyTorch、NVSHMEM 库
+- **库别名**：为 NVSHMEM 的三个组件创建别名（nvshmem、nvshmem_host、nvshmem_device）
+- **路径配置**：配置 CUDA、PyTorch、NVSHMEM 的头文件和库文件搜索路径
+- **子目录构建**：包含 `kernels/` 目录的 CMakeLists.txt
+- **PyBind11 模块**：编译 `deep_ep.cpp` 为 `deep_ep_cpp` Python 模块，链接 CUDA 库、PyTorch 库、torch_python

@@ -1,0 +1,1327 @@
+# deep_ep::internode_ll 低延迟互连通信内核
+
+来源: csrc/kernels/internode_ll.cu
+
+---
+
+## 辅助函数
+
+### is_rank_masked
+
+```
+【签名】
+    @device
+    is_rank_masked<use_warp_sync: bool>(mask_buffer_ptr: int*, rank: int) -> bool
+
+【算法】
+    if mask_buffer_ptr == nullptr:
+        return false
+    
+    if use_warp_sync:
+        # Warp内同步读取，lane 0广播
+        return __shfl_sync(0xffffffff, ld_acquire_global(mask_buffer_ptr + rank), 0) != 0
+    else:
+        return ld_acquire_global(mask_buffer_ptr + rank) != 0
+```
+
+### barrier
+
+```
+【签名】
+    @device
+    barrier<kNumThreads: int>(
+        thread_id: int,
+        rank: int,
+        num_ranks: int,
+        mask_buffer_ptr: int*,
+        sync_buffer_ptr: int*
+    )
+
+【算法】
+    # Step 1: Quiet所有QP连接
+    qps_per_rank = ibgda_get_state().num_rc_per_pe * ibgda_get_state().num_devices_initialized
+    
+    parallel_for i in range(qps_per_rank * (num_ranks - 1)):
+        dst_rank = (rank + 1 + i / qps_per_rank) % num_ranks
+        qp_id = i % qps_per_rank
+        nvshmemi_ibgda_quiet(dst_rank, qp_id)
+    
+    # Step 2: 更新本地计数器
+    if thread_id == 0:
+        atomicAdd(sync_buffer_ptr + rank, -1)
+    __syncthreads()
+    
+    cnt = sync_buffer_ptr[rank]
+    
+    # Step 3: 更新远程计数器并等待
+    if thread_id < num_ranks and thread_id != rank:
+        dst_rank = thread_id
+        dst_ptr = reinterpret_cast<uint64_t>(sync_buffer_ptr + rank)
+        dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank)
+        
+        if not is_rank_masked(mask_buffer_ptr, dst_rank):
+            # 写入远程计数器
+            if dst_p2p_ptr == 0:
+                nvshmemi_ibgda_rma_p(reinterpret_cast<int*>(dst_ptr), cnt, dst_rank, 0)
+            else:
+                st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), cnt)
+            
+            # 等待远程更新
+            start_time = clock64()
+            while ld_acquire_sys_global(sync_buffer_ptr + dst_rank) != cnt and \
+                  (clock64() - start_time) <= NUM_TIMEOUT_CYCLES:
+                pass
+            
+            # 超时处理
+            if (clock64() - start_time) > NUM_TIMEOUT_CYCLES:
+                printf("Warning: DeepEP timeout for barrier, rank %d, dst_rank %d\n", rank, dst_rank)
+                if mask_buffer_ptr == nullptr:
+                    trap()
+                atomicExch(mask_buffer_ptr + dst_rank, 1)
+    
+    __syncthreads()
+
+【并行模式】
+    - QP quiet: 多线程并行
+    - 远程更新: thread_id < num_ranks 的线程各自负责一个目标rank
+```
+
+---
+
+## 清理函数
+
+### clean_low_latency_buffer (kernel)
+
+```
+【签名】
+    @device
+    clean_low_latency_buffer<kNumThreads: int>(
+        clean_0: int*,
+        num_clean_int_0: int,
+        clean_1: int*,
+        num_clean_int_1: int,
+        rank: int,
+        num_ranks: int,
+        mask_buffer_ptr: int*,
+        sync_buffer_ptr: int*
+    )
+
+【算法】
+    thread_id = threadIdx.x
+    
+    # Barrier前同步
+    if sync_buffer_ptr == nullptr:
+        nvshmemx_barrier_all_block()
+    else:
+        barrier<kNumThreads>(thread_id, rank, num_ranks, mask_buffer_ptr, sync_buffer_ptr)
+    
+    # 清零两个缓冲区
+    parallel_for i in range(num_clean_int_0):
+        clean_0[i] = 0
+    
+    parallel_for i in range(num_clean_int_1):
+        clean_1[i] = 0
+    
+    # Barrier后同步
+    if sync_buffer_ptr == nullptr:
+        nvshmemx_barrier_all_block()
+    else:
+        barrier<kNumThreads>(thread_id, rank, num_ranks, mask_buffer_ptr, sync_buffer_ptr)
+
+【并行模式】
+    block: kNumThreads=256
+    grid: 1
+```
+
+### clean_low_latency_buffer (host)
+
+```
+【签名】
+    @host→device
+    clean_low_latency_buffer(
+        clean_0: int*,
+        num_clean_int_0: int,
+        clean_1: int*,
+        num_clean_int_1: int,
+        rank: int,
+        num_ranks: int,
+        mask_buffer_ptr: int*,
+        sync_buffer_ptr: int*,
+        stream: cudaStream_t
+    )
+
+【算法】
+    LAUNCH_KERNEL(
+        grid=1, block=256, stream,
+        clean_low_latency_buffer<256>,
+        clean_0, num_clean_int_0,
+        clean_1, num_clean_int_1,
+        rank, num_ranks,
+        mask_buffer_ptr, sync_buffer_ptr
+    )
+```
+
+---
+
+## Dispatch 函数 (分发阶段)
+
+### dispatch (kernel)
+
+```
+【签名】
+    @device
+    dispatch<kUseFP8: bool, kUseUE8M0: bool, kHidden: int>(
+        packed_recv_x: void*,                        # 打包后的接收数据
+        packed_recv_x_scales: void*,                 # FP8量化scale
+        packed_recv_src_info: int*,                  # 源token索引
+        packed_recv_layout_range: int64_t*,          # [num_recv, begin_idx]
+        packed_recv_count: int*,                     # 接收计数
+        mask_buffer_ptr: int*,                       # rank掩码
+        cumulative_local_expert_recv_stats: int*,    # 统计信息
+        dispatch_wait_recv_cost_stats: int64_t*,     # 等待耗时统计
+        rdma_recv_x: void*,                          # RDMA接收缓冲
+        rdma_recv_count: int*,                       # RDMA接收计数
+        rdma_x: void*,                               # RDMA发送缓冲
+        x: void*,                                    # 输入数据 [num_tokens, kHidden] BF16
+        topk_idx: topk_idx_t*,                       # topk专家索引 [num_tokens, num_topk]
+        atomic_counter_per_expert: int*,             # 每专家计数器 (workspace)
+        atomic_finish_counter_per_expert: int*,      # 完成计数器 (workspace)
+        next_clean: int*,                            # 下次清理缓冲
+        num_next_clean_int: int,
+        num_tokens: int,
+        num_max_dispatch_tokens_per_rank: int,
+        num_topk: int,
+        num_experts: int,
+        rank: int,
+        num_ranks: int,
+        num_warp_groups: int,
+        num_warps_per_group: int,
+        round_scale: bool,
+        phases: int                                  # LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE
+    )
+
+【算法】
+    # 线程组织
+    sm_id = blockIdx.x
+    thread_id = threadIdx.x
+    warp_id = thread_id / 32
+    lane_id = get_lane_id()
+    num_warps = num_warp_groups * num_warps_per_group
+    num_local_experts = num_experts / num_ranks
+    warp_group_id = warp_id / num_warps_per_group
+    sub_warp_id = warp_id % num_warps_per_group
+    responsible_expert_idx = sm_id * num_warp_groups + warp_group_id
+    
+    # 数据类型配置
+    scale_t = uint8_t if kUseUE8M0 else float
+    kNumPerChannels = 128
+    num_scales = kHidden / kNumPerChannels
+    hidden_bytes = kHidden * (sizeof(__nv_fp8_storage_t) if kUseFP8 else sizeof(nv_bfloat16))
+    
+    # 消息格式: [int4头部(源索引+3个保留字段), hidden数据, FP8 scales(可选)]
+    num_bytes_per_msg = sizeof(int4) + (kUseFP8 ? (kHidden + num_scales*sizeof(float)) : (kHidden*sizeof(nv_bfloat16)))
+    
+    # === 发送阶段 ===
+    if phases & LOW_LATENCY_SEND_PHASE:
+        
+        # Warp角色划分: 前(num_warps-1)个warp负责FP8转换和发送, 最后1个warp负责统计
+        if warp_id < num_warps - 1:
+            # === 数据处理和发送 ===
+            num_threads = (num_warps - 1) * 32
+            
+            parallel_for token_idx in range(num_tokens):  # SM并行
+                x_int4 = x + token_idx * (kHidden/kNumElemsPerRead)
+                rdma_x_src_idx = rdma_x + token_idx * num_bytes_per_msg
+                rdma_x_vec = rdma_x_src_idx + sizeof(int4)
+                rdma_x_scales = rdma_x_vec + hidden_bytes  # FP8 scales位置
+                
+                # 重叠读取topk索引和写入源索引
+                dst_expert_idx = (warp_id < num_topk) ? topk_idx[token_idx * num_topk + warp_id] : -1
+                if thread_id == 0:
+                    *rdma_x_src_idx = token_idx
+                
+                # === FP8转换 (如果启用) ===
+                parallel_for i in range(hidden_bf16_int4):  # Warp并行
+                    int4_value = __ldg(x_int4 + i)
+                    
+                    if kUseFP8:
+                        # 计算local amax
+                        bf16_values = reinterpret_cast<nv_bfloat16*>(&int4_value)
+                        fp32_values[kNumElemsPerRead]
+                        amax = kFP8Margin
+                        for j in range(kNumElemsPerRead):
+                            fp32_values[j] = float(bf16_values[j])
+                            amax = max(amax, abs(fp32_values[j]))
+                        
+                        # Warp reduce amax (每16个lane一组)
+                        amax = warp_reduce_max<16>(amax)
+                        calculate_fp8_scales(amax, scale, scale_inv, round_scale)
+                        if lane_id == 0 or lane_id == 16:
+                            rdma_x_scales[i * kNumElemsPerRead / 128] = scale_inv
+                        
+                        # 转换为FP8
+                        for j in range(0, kNumElemsPerRead, 2):
+                            fp32x2 = {fp32_values[j] * scale, fp32_values[j+1] * scale}
+                            fp8x2_values[j/2] = __nv_cvt_float2_to_fp8x2(fp32x2, __NV_SATFINITE, __NV_E4M3)
+                        rdma_x_vec[i] = int2_value
+                    else:
+                        # BF16直接复制
+                        rdma_x_vec[i] = int4_value
+                
+                __syncwarp()  # bar.sync 1
+                
+                # === 发送RDMA ===
+                if dst_expert_idx >= 0:
+                    # 分配slot
+                    slot_idx = (lane_id == 0) ? atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1) : 0
+                    slot_idx = __shfl_sync(0xffffffff, slot_idx, 0)
+                    
+                    dst_rank = dst_expert_idx / num_local_experts
+                    dst_expert_local_idx = dst_expert_idx % num_local_experts
+                    
+                    src_ptr = reinterpret_cast<uint64_t>(rdma_x_src_idx)
+                    dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) + \
+                              dst_expert_local_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg + \
+                              rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg + \
+                              slot_idx * num_bytes_per_msg
+                    
+                    dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank)
+                    
+                    if not is_rank_masked<true>(mask_buffer_ptr, dst_rank):
+                        if dst_p2p_ptr == 0:
+                            # RDMA PUT
+                            nvshmemi_ibgda_put_nbi_warp(dst_ptr, src_ptr, num_bytes_per_msg, dst_rank, dst_expert_local_idx, lane_id, slot_idx)
+                        else:
+                            # P2P直写
+                            UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_p2p_ptr, src_ptr, ld_nc_global, st_na_global)
+                    
+                    # 完成标记
+                    __syncwarp()
+                    if lane_id == 0:
+                        atomic_add_release_global(atomic_finish_counter_per_expert + dst_expert_idx, 1)
+        
+        elif warp_id == num_warps - 1:
+            # === 统计和清理warp ===
+            if sm_id == 0:
+                # SM0额外职责: 清理下个缓冲区
+                parallel_for i in range(num_next_clean_int):
+                    next_clean[i] = 0
+                
+                __syncwarp()
+                # 设置完成标记
+                parallel_for i in range(num_experts):
+                    atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG)
+            
+            # 统计每个专家的token数
+            expert_count[kNumMaxWarpGroups] = {0}
+            expert_begin_idx = sm_id * num_warp_groups
+            expert_end_idx = min(expert_begin_idx + num_warp_groups, num_experts)
+            
+            # Lane级计数
+            parallel_for i in range(num_tokens * num_topk):
+                idx = topk_idx[i]
+                if idx >= expert_begin_idx and idx < expert_end_idx:
+                    expert_count[idx - expert_begin_idx]++
+            
+            # Warp reduce
+            for i in range(expert_begin_idx, expert_end_idx):
+                sum = warp_reduce_sum(expert_count[i - expert_begin_idx])
+                if lane_id == 0:
+                    shared_num_tokens_sent_per_expert[i - expert_begin_idx] = sum
+                    atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum)
+        
+        __syncthreads()
+        
+        # === 发送计数 ===
+        if responsible_expert_idx < num_experts and sub_warp_id == 0 and lane_id == 0:
+            dst_rank = responsible_expert_idx / num_local_experts
+            dst_expert_local_idx = responsible_expert_idx % num_local_experts
+            num_tokens_sent = shared_num_tokens_sent_per_expert[responsible_expert_idx - sm_id * num_warp_groups]
+            
+            # 等待本地发送完成
+            while ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2:
+                pass
+            
+            # 发送计数 (负数编码: -num_tokens_sent - 1)
+            dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + dst_expert_local_idx * num_ranks + rank)
+            dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank)
+            
+            if not is_rank_masked(mask_buffer_ptr, dst_rank):
+                if dst_p2p_ptr == 0:
+                    nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), -num_tokens_sent - 1, dst_rank, dst_expert_local_idx)
+                else:
+                    st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), -num_tokens_sent - 1)
+            
+            # 清理workspace
+            atomic_counter_per_expert[responsible_expert_idx] = 0
+            atomic_finish_counter_per_expert[responsible_expert_idx] = 0
+            
+            # 清理packed_recv_count
+            if dst_rank == 0:
+                packed_recv_count[dst_expert_local_idx] = 0
+    
+    # === 接收阶段 ===
+    if phases & LOW_LATENCY_RECV_PHASE:
+        # Send-and-Recv模式需要grid sync
+        if phases & LOW_LATENCY_SEND_PHASE:
+            cg::this_grid().sync()
+        
+        if responsible_expert_idx < num_experts:
+            src_rank = responsible_expert_idx / num_local_experts
+            local_expert_idx = responsible_expert_idx % num_local_experts
+            
+            rdma_recv_x_uint8 = rdma_recv_x + \
+                local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg + \
+                src_rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg
+            
+            recv_x_int4 = packed_recv_x + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * hidden_int4
+            recv_src_info = packed_recv_src_info + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank
+            recv_range = packed_recv_layout_range + local_expert_idx * num_ranks
+            recv_x_scales = packed_recv_x_scales + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_aligned_scales
+            
+            # === 等待接收 (sub-warp 1负责) ===
+            if sub_warp_id == 1 and lane_id == 0:
+                start_time = clock64()
+                wait_recv_cost = 0
+                num_recv_tokens = 0
+                
+                if not is_rank_masked(mask_buffer_ptr, src_rank):
+                    # 等待rdma_recv_count非零
+                    while (num_recv_tokens = ld_acquire_sys_global(rdma_recv_count + local_expert_idx * num_ranks + src_rank)) == 0 and \
+                          (wait_recv_cost = clock64() - start_time) <= NUM_TIMEOUT_CYCLES:
+                        pass
+                
+                # 超时或掩码处理
+                if num_recv_tokens == 0:
+                    num_recv_tokens = -1
+                
+                if wait_recv_cost > NUM_TIMEOUT_CYCLES:
+                    printf("Warning: DeepEP timeout for dispatch receive, rank %d, local_expert_idx %d, src_rank %d\n",
+                           rank, local_expert_idx, src_rank)
+                    if mask_buffer_ptr == nullptr:
+                        trap()
+                    atomicExch(mask_buffer_ptr + src_rank, 1)
+                
+                # 解码负数编码
+                num_recv_tokens = -num_recv_tokens - 1
+                recv_token_begin_idx = atomicAdd(packed_recv_count + local_expert_idx, num_recv_tokens)
+                
+                shared_num_recv_tokens[warp_group_id] = num_recv_tokens
+                shared_recv_token_begin_idx[warp_group_id] = recv_token_begin_idx
+                recv_range[src_rank] = pack2<int, int64_t>(num_recv_tokens, recv_token_begin_idx)
+                
+                # 统计
+                if cumulative_local_expert_recv_stats != nullptr:
+                    atomicAdd(cumulative_local_expert_recv_stats + local_expert_idx, num_recv_tokens)
+                if dispatch_wait_recv_cost_stats != nullptr:
+                    atomicAdd(reinterpret_cast<unsigned long long*>(dispatch_wait_recv_cost_stats + src_rank), wait_recv_cost)
+            
+            # Warp组内同步
+            asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 2), "r"(num_warps_per_group * 32))
+            num_recv_tokens = shared_num_recv_tokens[warp_group_id]
+            recv_token_begin_idx = shared_recv_token_begin_idx[warp_group_id]
+            
+            # === 拷贝tokens (sub-warp并行) ===
+            parallel_for i in range(num_recv_tokens):  # sub_warp_id并行
+                src_src_idx = reinterpret_cast<int*>(rdma_recv_x_uint8 + i * num_bytes_per_msg)
+                
+                # 拷贝源索引
+                if lane_id == 0:
+                    recv_src_info[recv_token_begin_idx + i] = ld_nc_global(src_src_idx)
+                __syncwarp()
+                
+                # 拷贝数据
+                src_data = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(src_src_idx) + sizeof(int4))
+                dst_data = recv_x_int4 + (recv_token_begin_idx + i) * hidden_int4
+                UNROLLED_WARP_COPY(7, lane_id, hidden_int4, dst_data, src_data, ld_nc_global, st_na_global)
+                
+                # 拷贝FP8 scales (如果启用)
+                if kUseFP8:
+                    src_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(src_data) + hidden_bytes)
+                    num_elems_per_pack = sizeof(packed_t) / sizeof(scale_t)
+                    token_idx = recv_token_begin_idx + i
+                    token_stride = num_elems_per_pack
+                    pack_stride = num_ranks * num_max_dispatch_tokens_per_rank * num_elems_per_pack
+                    
+                    # 两次unroll展开 (最多64个scales)
+                    if lane_id < num_scales:
+                        pack_idx = lane_id / num_elems_per_pack
+                        elem_idx = lane_id % num_elems_per_pack
+                        scale = extract_required_scale_format<kUseUE8M0>(ld_nc_global(src_scales + lane_id))
+                        recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] = scale
+                    
+                    if lane_id + 32 < num_scales:
+                        pack_idx = (lane_id + 32) / num_elems_per_pack
+                        elem_idx = (lane_id + 32) % num_elems_per_pack
+                        scale = extract_required_scale_format<kUseUE8M0>(ld_nc_global(src_scales + lane_id + 32))
+                        recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] = scale
+
+【并行模式】
+    grid: (num_sms,)
+    block: (num_warps * 32,)
+    
+    SM级:
+        - 每个SM负责 num_warp_groups 个专家
+    
+    Warp角色:
+        - 前(num_warps-1)个warp: FP8转换和RDMA发送
+        - 最后1个warp: 统计token数、清理缓冲
+    
+    Sub-warp角色 (接收阶段):
+        - sub-warp 0: 数据拷贝
+        - sub-warp 1: 等待接收计数
+    
+    优化:
+        - 重叠topk读取和源索引写入
+        - Warp级FP8转换 (16-lane reduce)
+        - Unrolled warp copy (8/7次展开)
+        - 负数编码计数 (-num-1) 减少RTT
+
+【备注】
+    - phases控制发送/接收阶段: LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE
+    - FP8: E4M3格式, 每128通道一个scale
+    - UE8M0: 8位无符号整数scale格式
+    - FINISHED_SUM_TAG: 双阶段标记 (统计完成 + 发送完成)
+    - 超时机制: NUM_TIMEOUT_CYCLES后mask掉故障rank
+```
+
+### dispatch (host)
+
+```
+【签名】
+    @host→device
+    dispatch(
+        packed_recv_x: void*,
+        packed_recv_x_scales: void*,
+        packed_recv_src_info: int*,
+        packed_recv_layout_range: int64_t*,
+        packed_recv_count: int*,
+        mask_buffer_ptr: int*,
+        cumulative_local_expert_recv_stats: int*,
+        dispatch_wait_recv_cost_stats: int64_t*,
+        rdma_recv_x: void*,
+        rdma_recv_count: int*,
+        rdma_x: void*,
+        x: void*,
+        topk_idx: topk_idx_t*,
+        next_clean: int*,
+        num_next_clean_int: int,
+        num_tokens: int,
+        hidden: int,
+        num_max_dispatch_tokens_per_rank: int,
+        num_topk: int,
+        num_experts: int,
+        rank: int,
+        num_ranks: int,
+        use_fp8: bool,
+        round_scale: bool,
+        use_ue8m0: bool,
+        workspace: void*,
+        num_device_sms: int,
+        stream: cudaStream_t,
+        phases: int
+    )
+
+【算法】
+    # 计算启动配置
+    num_warp_groups = ceil_div(num_experts, num_device_sms)
+    num_warps_per_group = 32 / num_warp_groups
+    num_warps = num_warp_groups * num_warps_per_group
+    num_sms = ceil_div(num_experts, num_warp_groups)
+    
+    # Workspace分配
+    atomic_counter_per_expert = workspace
+    atomic_finish_counter_per_expert = workspace + num_experts * sizeof(int)
+    
+    # 根据hidden选择kernel (模板特化)
+    dispatch_func = dispatch<false, false, hidden>
+    if use_fp8 and not use_ue8m0:
+        dispatch_func = dispatch<true, false, hidden>
+    if use_fp8 and use_ue8m0:
+        dispatch_func = dispatch<true, true, hidden>
+    
+    LAUNCH_KERNEL(
+        grid=num_sms, block=num_warps*32, stream,
+        dispatch_func,
+        packed_recv_x, packed_recv_x_scales, packed_recv_src_info,
+        packed_recv_layout_range, packed_recv_count,
+        mask_buffer_ptr, cumulative_local_expert_recv_stats, dispatch_wait_recv_cost_stats,
+        rdma_recv_x, rdma_recv_count, rdma_x,
+        x, topk_idx,
+        atomic_counter_per_expert, atomic_finish_counter_per_expert,
+        next_clean, num_next_clean_int,
+        num_tokens, num_max_dispatch_tokens_per_rank, num_topk,
+        num_experts, rank, num_ranks,
+        num_warp_groups, num_warps_per_group,
+        round_scale, phases
+    )
+
+【备注】
+    - 通过 SWITCH_HIDDEN 宏支持多种hidden维度 (编译期模板特化)
+    - Workspace需求: 2 * num_experts * sizeof(int)
+    - kNumMaxTopK限制: 11
+```
+
+---
+
+## LogFMT 压缩函数 (可选压缩格式)
+
+### logfmt_encode
+
+```
+【签名】
+    @device
+    logfmt_encode<kNumSendUnrolls: int>(
+        buffer: void*,                    # 输入/输出缓冲 (in-place)
+        shared_amaxmin: nv_bfloat162*,    # 输出min/max到shared memory
+        lane_id: int
+    ) -> int                              # 返回TMA拷贝字节数
+
+【算法】
+    # 常量
+    kLogThreshold = 0
+    kMinClip = 32  # log_2(2^(2^5))
+    kNumBits = 10
+    kNumValues = 1 << (kNumBits - 1)  # 512
+    
+    # 读取BF16数据 (每lane读kNumSendUnrolls个int4)
+    int4_values[kNumSendUnrolls]
+    bf162_values = reinterpret_cast<nv_bfloat162*>(int4_values)
+    
+    ld_buffer = buffer + lane_id * (kNumSendUnrolls * sizeof(int4))
+    st_buffer = buffer + lane_id * (kNumSendUnrolls * sizeof(int4) * 10 / 16)  # 压缩后偏移
+    
+    # === Step 1: 计算amax/amin和符号 ===
+    bf162_amax = 0
+    bf162_amin = INF
+    local_signs = 0  # 32位打包符号
+    
+    for k in range(kNumSendUnrolls * kNumElemsPerInt4 / 2):
+        uint32_values[k] = ld_buffer[k]
+        local_signs |= ((uint32_values[k] >> 15) & 1) << (k * 2)
+        local_signs |= ((uint32_values[k] >> 31) & 1) << (k * 2 + 1)
+        uint32_values[k] &= 0x7fff7fff  # 清除符号位
+        
+        bf162_amax = max(bf162_amax, bf162_values[k])
+        bf162_amin = min(bf162_amin, bf162_values[k])
+    
+    # === Step 2: Warp reduce (每kNumLanesToReduce个lane一组) ===
+    amax = max(bf162_amax.x, bf162_amax.y)
+    amin = min(bf162_amin.x, bf162_amin.y)
+    kNumLanesToReduce = 128 * sizeof(nv_bfloat16) / (kNumSendUnrolls * sizeof(int4))
+    
+    amax = warp_reduce_max<kNumLanesToReduce>(amax)
+    amin = warp_reduce_min<kNumLanesToReduce>(amin)
+    
+    # 写入shared memory
+    if shared_amaxmin != nullptr:
+        *shared_amaxmin = __nv_bfloat162(amax, amin)
+    __syncwarp()
+    
+    # === Step 3: 判断是否压缩 ===
+    log_amax = log2f_approx(amax)
+    log_amin = max(log2f_approx(amin), log_amax - kMinClip)
+    enable_cast = warp_reduce_and<kNumLanesToReduce, true>(log_amax < kLogThreshold and log_amin < log_amax)
+    
+    # === Step 4: LogFMT-10编码 (如果enable_cast) ===
+    if enable_cast:
+        step = (log_amax - log_amin) / (kNumValues - 2)
+        step_inv = 1.0 / step
+        rounding = 2.0 - log2f_approx((1.0 + exp2f_approx(step)) * 0.5) * step_inv
+        fused_rounding = rounding - log_amin * step_inv
+        
+        # 编码: 每256位打包成160位 (10位/值)
+        for i in range(kNumSendUnrolls / 2):
+            # 转换为10位整数
+            for k in range(kNumElemsPerInt4):
+                [x, y] = __bfloat1622float2(bf162_values[i * kNumElemsPerInt4 + k])
+                encoded[k*2 + 0] = max(0, __float2uint_rd(log2f_approx(x) * step_inv + fused_rounding))
+                encoded[k*2 + 1] = max(0, __float2uint_rd(log2f_approx(y) * step_inv + fused_rounding))
+            
+            # 打包成5个uint32 (16个10位值)
+            st_buffer[i*5 + 0] = (encoded[0]>>0) | (encoded[1]<<9) | (encoded[2]<<18) | (encoded[3]<<27)
+            st_buffer[i*5 + 1] = (encoded[3]>>5) | (encoded[4]<<4) | (encoded[5]<<13) | (encoded[6]<<22) | (encoded[7]<<31)
+            st_buffer[i*5 + 2] = (encoded[7]>>1) | (encoded[8]<<8) | (encoded[9]<<17) | (encoded[10]<<26)
+            st_buffer[i*5 + 3] = (encoded[10]>>6) | (encoded[11]<<3) | (encoded[12]<<12) | (encoded[13]<<21) | (encoded[14]<<30)
+            st_buffer[i*5 + 4] = (encoded[14]>>2) | (encoded[15]<<7) | ((i==0) ? (local_signs<<16) : (local_signs & 0xffff0000u))
+        
+        tma_store_fence()
+        __syncwarp()
+        
+        return 32 * (kNumSendUnrolls * sizeof(int4) * 8 * 10 / 16 / 8)  # 压缩后字节数
+    else:
+        return 32 * (kNumSendUnrolls * sizeof(int4))  # 原始字节数
+
+【备注】
+    - LogFMT-10: 对数浮点格式, 10位编码, 压缩率5/8
+    - 编码公式: encoded = max(0, floor(log2(x) * step_inv + fused_rounding))
+    - 符号单独存储在最后uint32的高16位
+    - 只有当log_amax < 0 (值全部<1) 且动态范围<2^32时才压缩
+```
+
+### logfmt_check_amaxmin
+
+```
+【签名】
+    @device
+    logfmt_check_amaxmin<kNumLanes: int, kNumSendUnrolls: int, kNumRecvUnrolls: int>(
+        meta_buffer: uint8_t*,           # 元数据缓冲 (min/max pairs)
+        shared_log_amax: float2*,        # 输出log(amax)
+        shared_log_amin: float2*,        # 输出log(amin)
+        shared_cast_info: int*,          # 输出压缩信息 [num_casted_prefix << 1 | casted]
+        lane_id: int
+    )
+
+【算法】
+    kLogThreshold = 0
+    kMinClip = 32
+    
+    enable_cast = true
+    if lane_id < kNumLanes:
+        # 读取两对min/max (uint64 = 2 x nv_bfloat162)
+        amaxmin2 = reinterpret_cast<uint64_t*>(meta_buffer)[lane_id]
+        bf162_amaxmin = reinterpret_cast<__nv_bfloat162*>(&amaxmin2)
+        
+        for i in range(2):
+            amax = float(bf162_amaxmin[i].x)
+            amin = float(bf162_amaxmin[i].y)
+            log_amax[i] = log2f_approx(amax)
+            log_amin[i] = (amin == 0) ? (log_amax[i] - kMinClip) : max(log2f_approx(amin), log_amax[i] - kMinClip)
+            enable_cast = enable_cast and (log_amax[i] < kLogThreshold) and (log_amin[i] < log_amax[i])
+        
+        shared_log_amax[lane_id] = make_float2(log_amax[0], log_amax[1])
+        shared_log_amin[lane_id] = make_float2(log_amin[0], log_amin[1])
+    
+    # Warp reduce: 计算每个division是否压缩
+    casted = warp_reduce_and<kNumSendUnrolls>(enable_cast) ? (1u << (lane_id / kNumRecvUnrolls)) : 0u
+    num_casted_prefix = __popc(warp_reduce_or<kNumRecvUnrolls, true>(casted) & ((1u << (lane_id / kNumRecvUnrolls)) - 1))
+    
+    if lane_id < kNumLanes and lane_id % kNumRecvUnrolls == 0:
+        shared_cast_info[lane_id / kNumRecvUnrolls] = (num_casted_prefix << 1) | (casted ? 1u : 0u)
+    __syncwarp()
+
+【备注】
+    - 预先检查元数据判断是否压缩, 用于接收端
+    - shared_cast_info编码: [前缀已压缩数 | 当前是否压缩]
+```
+
+### decode_and_accumulate
+
+```
+【签名】
+    @device
+    decode_and_accumulate<kNumRecvUnrolls: int>(
+        ld_buffer: uint32_t*,        # 输入缓冲 (可能是LogFMT或BF16)
+        accum: float*,               # 累加器 [kNumElemsPerInt4 * kNumRecvUnrolls]
+        log_amax: float,
+        log_amin: float,
+        enable_cast: bool,           # 是否为LogFMT格式
+        weight: float                # topk权重
+    )
+
+【算法】
+    if enable_cast:
+        # === LogFMT-10解码 ===
+        kNumBits = 10
+        kNumValues = 1 << (kNumBits - 1)
+        step = (log_amax - log_amin) / (kNumValues - 2)
+        
+        decode = lambda encoded, sign:
+            if encoded == 0:
+                return 0
+            decoded = exp2f_approx((encoded - 1) * step + log_amin)
+            return -decoded if sign else decoded
+        
+        # 解包: 每kNumRecvUnrolls/2次迭代处理160位 -> 16个10位值
+        for i in range(kNumRecvUnrolls / 2):
+            # 读取5个uint32
+            concat[6]
+            concat[0] = ld_buffer[i*5]
+            for k in range(1, 5):
+                concat[k] = (ld_buffer[i*5 + k - 1] >> (32 - k*5)) | (ld_buffer[i*5 + k] << (k*5))
+            concat[5] = ld_buffer[i*5 + 4] >> 7
+            
+            local_signs = ld_buffer[i*5 + 4] >> 16
+            
+            # 解码16个值
+            for k in range(5):
+                accum[i*16 + k*3 + 0] += decode((concat[k] >> 0) & 0x1ff, (local_signs >> (k*3+0)) & 1) * weight
+                accum[i*16 + k*3 + 1] += decode((concat[k] >> 9) & 0x1ff, (local_signs >> (k*3+1)) & 1) * weight
+                accum[i*16 + k*3 + 2] += decode((concat[k] >> 18) & 0x1ff, (local_signs >> (k*3+2)) & 1) * weight
+            accum[i*16 + 15] += decode(concat[5] & 0x1ff, (local_signs >> 15) & 1) * weight
+    else:
+        # === BF16直接累加 ===
+        for k in range(kNumRecvUnrolls * 4):
+            bf16_pack = *reinterpret_cast<__nv_bfloat162*>(ld_buffer + k)
+            accum[k*2 + 0] += float(bf16_pack.x) * weight
+            accum[k*2 + 1] += float(bf16_pack.y) * weight
+
+【备注】
+    - 用于combine阶段的解码和topk加权累加
+    - 解码公式: decoded = (encoded == 0) ? 0 : exp2((encoded - 1) * step + log_amin)
+```
+
+---
+
+## Combine 函数 (合并阶段)
+
+### combine (kernel)
+
+```
+【签名】
+    @device
+    combine<kUseLogFMT: bool, kHidden: int, kNumMaxTopk: int, kNumMaxUnrolls: int>(
+        combined_x: void*,                      # 输出 [num_combined_tokens, kHidden] BF16
+        rdma_recv_x: void*,                     # RDMA接收缓冲
+        rdma_recv_flag: int*,                   # 接收完成标记
+        rdma_send_x: void*,                     # RDMA发送缓冲
+        x: void*,                               # 输入数据 (dispatch后的数据)
+        topk_idx: topk_idx_t*,                  # [num_combined_tokens, num_topk]
+        topk_weights: float*,                   # [num_combined_tokens, num_topk]
+        src_info: int*,                         # 源token索引
+        layout_range: int64_t*,                 # [num_tokens, begin_idx]
+        mask_buffer_ptr: int*,
+        combine_wait_recv_cost_stats: int64_t*,
+        next_clean: int*,
+        num_next_clean_int: int,
+        atomic_clean_flag: int*,                # Workspace: 清理同步标记
+        num_combined_tokens: int,
+        hidden: int,
+        num_topk: int,
+        num_max_dispatch_tokens_per_rank: int,
+        num_experts: int,
+        rank: int,
+        num_ranks: int,
+        num_warp_groups: int,
+        num_warps_per_group: int,
+        phases: int,
+        zero_copy: bool
+    )
+
+【算法】
+    # 线程组织
+    sm_id = blockIdx.x
+    thread_id = threadIdx.x
+    warp_id = thread_id / 32
+    lane_id = get_lane_id()
+    num_local_experts = num_experts / num_ranks
+    warp_group_id = warp_id / num_warps_per_group
+    sub_warp_id = warp_id % num_warps_per_group
+    responsible_expert_idx = sm_id * num_warp_groups + warp_group_id
+    
+    # 数据类型配置
+    kNumSendUnrolls = (kHidden % (32 * 4 * sizeof(int4) / sizeof(nv_bfloat16)) == 0) ? 4 : 2
+    kNumRecvUnrolls = 2
+    hidden_bf16_int4_pad = align_up(kHidden / kNumElemsPerInt4, 32 * kNumSendUnrolls)
+    
+    # 消息格式 (LogFMT模式)
+    kNumDivisions = kHidden / 128
+    kNumMetaBytes = kNumDivisions * sizeof(nv_bfloat162)  # min/max pairs
+    num_bytes_per_slot = kHidden * sizeof(nv_bfloat16) + kNumMetaBytes
+    
+    extern __shared__ uint8_t smem_buffer[];
+    
+    # === 发送阶段 ===
+    if phases & LOW_LATENCY_SEND_PHASE:
+        
+        # 清理下个缓冲区 (SM0, warp_group 0, sub_warp 0)
+        if sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0:
+            parallel_for i in range(num_next_clean_int):
+                next_clean[i] = 0
+            
+            __syncwarp()
+            if lane_id == 0:
+                atomic_add_release_global(atomic_clean_flag, num_experts)
+        
+        # === 发送RDMA ===
+        if responsible_expert_idx < num_experts:
+            dst_rank = responsible_expert_idx / num_local_experts
+            local_expert_idx = responsible_expert_idx % num_local_experts
+            global_expert_idx = rank * num_local_experts + local_expert_idx
+            
+            layout = __ldg(layout_range + local_expert_idx * num_ranks + dst_rank)
+            local_x = x + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * hidden_bf16_int4
+            local_src_info = src_info + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank
+            rdma_send_x_vec = rdma_send_x + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_slot
+            
+            unpack2(layout, num_tokens_to_send, offset)
+            
+            # === TMA配置 ===
+            kNumTMABufferBytes = sizeof(int4) * 32 * kNumSendUnrolls
+            kNumStages = 3
+            kNumPrefetch = 1
+            
+            smem_ptr = smem_buffer + warp_id * (kNumStages * (kNumTMABufferBytes + 16) + kNumMetaBytes)
+            tma_buffers = [smem_ptr + i * (kNumTMABufferBytes + 16) for i in range(kNumStages)]
+            full_barriers = [smem_ptr + i * (kNumTMABufferBytes + 16) + kNumTMABufferBytes for i in range(kNumStages)]
+            meta_buffers = smem_ptr + kNumStages * (kNumTMABufferBytes + 16)  # LogFMT min/max
+            
+            # 初始化m-barriers
+            if lane_id < kNumStages:
+                mbarrier_init(full_barriers[lane_id], 1)
+                fence_barrier_init()
+            __syncwarp()
+            
+            # === 发送每个token ===
+            if not is_rank_masked<true>(mask_buffer_ptr, dst_rank):
+                parallel_for token_idx in range(offset, offset + num_tokens_to_send):  # sub_warp并行
+                    x_int4 = local_x + token_idx * hidden_bf16_int4
+                    rdma_send_type_row = reinterpret_cast<int*>(rdma_send_x_vec + token_idx * num_bytes_per_slot)
+                    rdma_send_x_vec_row = reinterpret_cast<uint8_t*>(rdma_send_type_row)
+                    
+                    src_idx = __shfl_sync(0xffffffff, __ldg(local_src_info + token_idx), 0)
+                    buf_ptr = reinterpret_cast<int64_t>(rdma_send_x_vec_row)
+                    dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) + \
+                              (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * num_bytes_per_slot
+                    dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank)
+                    num_send_bytes = hidden * sizeof(nv_bfloat16)
+                    
+                    # === 拷贝数据 (可选LogFMT压缩) ===
+                    if not zero_copy or dst_p2p_ptr != 0:
+                        cpy_src_int4_ptr = (buf_ptr if zero_copy else x_int4)
+                        cpy_dst_int4_ptr = (buf_ptr if dst_p2p_ptr == 0 else dst_p2p_ptr)
+                        
+                        # TMA prefetch
+                        if elect_one_sync():
+                            tma_load_and_arrive(0, cpy_src_int4_ptr, get_num_tma_bytes(0))
+                        __syncwarp()
+                        
+                        tma_offset_bytes = kNumMetaBytes
+                        kNumIters = hidden_bf16_int4_pad / (32 * kNumSendUnrolls)
+                        
+                        for i in range(0, hidden_bf16_int4_pad, 32 * kNumSendUnrolls):  # iter_idx
+                            stage_idx = iter_idx % kNumStages
+                            next_stage_idx = (iter_idx + 1) % kNumStages
+                            
+                            # Prefetch next
+                            if iter_idx + 1 < kNumIters and elect_one_sync():
+                                tma_store_wait<kNumStages - kNumPrefetch - 1>()
+                                offset_int4 = i + 32 * kNumSendUnrolls
+                                tma_load_and_arrive(next_stage_idx, cpy_src_int4_ptr + offset_int4, get_num_tma_bytes(offset_int4))
+                            __syncwarp()
+                            
+                            # Wait current
+                            mbarrier_wait<true>(full_barriers[stage_idx], tma_phase, stage_idx)
+                            
+                            if kUseLogFMT:
+                                # LogFMT编码
+                                kNumInt4PerDivision = 128 / kNumElemsPerInt4
+                                num_tma_bytes = logfmt_encode<kNumSendUnrolls>(
+                                    tma_buffers[stage_idx],
+                                    (i % kNumInt4PerDivision == 0) ? meta_buffers + i / kNumInt4PerDivision : nullptr,
+                                    lane_id
+                                )
+                                if elect_one_sync():
+                                    tma_store_1d(tma_buffers[stage_idx], cpy_dst_int4_ptr + tma_offset_bytes, num_tma_bytes)
+                                tma_offset_bytes += num_tma_bytes
+                            else:
+                                # BF16直接拷贝
+                                if elect_one_sync():
+                                    tma_store_1d(tma_buffers[stage_idx], cpy_dst_int4_ptr + i, get_num_tma_bytes(i))
+                            __syncwarp()
+                        
+                        # 存储元数据 (LogFMT)
+                        if kUseLogFMT:
+                            num_send_bytes = tma_offset_bytes
+                            if elect_one_sync():
+                                tma_store_1d(meta_buffers, cpy_dst_int4_ptr, kNumMetaBytes)
+                        
+                        tma_store_wait<0>()
+                        __syncwarp()
+                    
+                    # 发送RDMA
+                    if dst_p2p_ptr == 0:
+                        nvshmemi_ibgda_put_nbi_warp(dst_ptr, buf_ptr, num_send_bytes, dst_rank, local_expert_idx, lane_id, token_idx - offset)
+            
+            # === 发送完成标记 ===
+            asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 1), "r"(num_warps_per_group * 32))
+            if sub_warp_id == 1 and lane_id == 0:
+                # 等待清理标记
+                while ld_acquire_global(atomic_clean_flag) == 0:
+                    pass
+                
+                dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx)
+                dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank)
+                
+                if not is_rank_masked(mask_buffer_ptr, dst_rank):
+                    if dst_p2p_ptr == 0:
+                        nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), 1, dst_rank, local_expert_idx)
+                    else:
+                        st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), 1)
+                
+                atomic_add_release_global(atomic_clean_flag, -1)
+            __syncwarp()
+            
+            # 销毁m-barriers
+            if lane_id < kNumStages:
+                mbarrier_inval(full_barriers[lane_id])
+                fence_barrier_init()
+            __syncwarp()
+    
+    # === 接收阶段 ===
+    if phases & LOW_LATENCY_RECV_PHASE:
+        
+        # === 等待接收完成 ===
+        if responsible_expert_idx < num_experts:
+            if sub_warp_id == 0 and lane_id == 0:
+                src_rank = responsible_expert_idx / num_local_experts
+                start_time = clock64()
+                wait_recv_cost = 0
+                
+                if not is_rank_masked(mask_buffer_ptr, src_rank):
+                    while ld_acquire_sys_global(rdma_recv_flag + responsible_expert_idx) == 0 and \
+                          (wait_recv_cost = clock64() - start_time) <= NUM_TIMEOUT_CYCLES:
+                        pass
+                
+                # 超时处理
+                if wait_recv_cost > NUM_TIMEOUT_CYCLES:
+                    printf("Warning: DeepEP timeout for combine receive, rank %d, local_expert_idx %d, src_rank %d\n",
+                           rank, responsible_expert_idx % num_local_experts, src_rank)
+                    if mask_buffer_ptr == nullptr:
+                        trap()
+                    atomicExch(mask_buffer_ptr + src_rank, 1)
+                
+                if combine_wait_recv_cost_stats != nullptr:
+                    atomicAdd(reinterpret_cast<unsigned long long*>(combine_wait_recv_cost_stats + src_rank), wait_recv_cost)
+        
+        cg::this_grid().sync()
+        
+        # === 重新分配warp组 ===
+        kMaxNumGroups = 2
+        num_decode_warps = hidden_bf16_int4_pad / (kNumRecvUnrolls * 32)
+        num_groups = min(kMaxNumGroups, (num_threads / 32) / (num_decode_warps + 1))
+        decode_warp_idx = warp_id % (num_decode_warps + 1)
+        group_idx = warp_id / (num_decode_warps + 1)
+        
+        if group_idx < num_groups:
+            # === 重新分配shared memory ===
+            kNumStages = 3
+            kNumTMABufferBytes = 16 * 2 + kHidden * 2
+            kNumBF16PerWarpBytes = 32 * kNumRecvUnrolls * kNumElemsPerInt4 * 2
+            kNumLogFMTPerWarpBytes = kNumBF16PerWarpBytes / 16 * 10
+            kNumDivisionBytes = kNumDivisions * sizeof(uint32_t)
+            kNumBytesPerGroup = kNumStages * kNumTMABufferBytes + kHidden * 2 + kNumStages * kNumDivisionBytes * 3
+            
+            smem_group_buffer = smem_buffer + kNumBytesPerGroup * group_idx
+            full_barriers = [smem_group_buffer + i * kNumTMABufferBytes for i in range(kNumStages)]
+            empty_barriers = [smem_group_buffer + i * kNumTMABufferBytes + 8 for i in range(kNumStages)]
+            tma_ld_buffers = [smem_group_buffer + i * kNumTMABufferBytes + 16 for i in range(kNumStages)]
+            tma_st_buffers = [smem_group_buffer + kNumStages * kNumTMABufferBytes + i * kNumBF16PerWarpBytes for i in range(num_decode_warps)]
+            
+            # LogFMT元数据 (可选)
+            smem_group_ptr = smem_group_buffer + kNumStages * kNumTMABufferBytes + kHidden * 2
+            log_amax_buffers = [smem_group_ptr + i * kNumDivisionBytes for i in range(kNumStages)]
+            log_amin_buffers = [smem_group_ptr + kNumStages * kNumDivisionBytes + i * kNumDivisionBytes for i in range(kNumStages)]
+            cast_info_buffers = [smem_group_ptr + kNumStages * kNumDivisionBytes * 2 + i * kNumDivisionBytes for i in range(kNumStages)]
+            
+            tma_phase = (1 << kNumStages) - 1 if decode_warp_idx == num_decode_warps else 0
+            
+            # 初始化m-barriers
+            if decode_warp_idx == num_decode_warps and lane_id < kNumStages:
+                mbarrier_init(full_barriers[lane_id], 1)
+                mbarrier_init(empty_barriers[lane_id], num_decode_warps)
+            asm volatile("bar.sync %0, %1;" :: "r"(group_idx + 1), "r"((num_decode_warps + 1) * 32))
+            
+            stage_idx = 0
+            
+            if decode_warp_idx == num_decode_warps:
+                # === TMA加载warp ===
+                parallel_for token_idx in range(num_combined_tokens):  # SM和group并行
+                    # 读取topk索引
+                    if lane_id < num_topk:
+                        topk_idx_by_lane = topk_idx[token_idx * num_topk + lane_id]
+                    
+                    for i in range(num_topk):
+                        topk_idx_reg = __shfl_sync(0xffffffff, topk_idx_by_lane, i)
+                        if topk_idx_reg < 0:
+                            continue
+                        if is_rank_masked(mask_buffer_ptr, topk_idx_reg / num_local_experts):
+                            continue
+                        
+                        mbarrier_wait<true>(empty_barriers[stage_idx], tma_phase, stage_idx)
+                        
+                        buffer = rdma_recv_x + (topk_idx_reg * num_max_dispatch_tokens_per_rank + token_idx) * num_bytes_per_slot
+                        
+                        if kUseLogFMT:
+                            # 检查元数据判断压缩
+                            logfmt_check_amaxmin<kNumDivisions/2, kNumSendUnrolls, kNumRecvUnrolls>(
+                                buffer,
+                                reinterpret_cast<float2*>(log_amax_buffers[stage_idx]),
+                                reinterpret_cast<float2*>(log_amin_buffers[stage_idx]),
+                                cast_info_buffers[stage_idx],
+                                lane_id
+                            )
+                        
+                        if elect_one_sync():
+                            num_casted = 0
+                            if kUseLogFMT:
+                                info = cast_info_buffers[stage_idx][num_decode_warps - 1]
+                                num_casted = (info >> 1) + (info & 1)
+                            num_tma_bytes = num_casted * kNumLogFMTPerWarpBytes + (num_decode_warps - num_casted) * kNumBF16PerWarpBytes
+                            tma_load_1d(tma_ld_buffers[stage_idx], buffer + (kUseLogFMT ? kNumMetaBytes : 0), full_barriers[stage_idx], num_tma_bytes)
+                            mbarrier_arrive_and_expect_tx(full_barriers[stage_idx], num_tma_bytes)
+                        __syncwarp()
+                        stage_idx = (stage_idx + 1) % kNumStages
+            else:
+                # === 归约warp ===
+                parallel_for token_idx in range(num_combined_tokens):  # SM和group并行
+                    # 读取topk索引和权重
+                    if lane_id < num_topk:
+                        topk_idx_by_lane = topk_idx[token_idx * num_topk + lane_id]
+                        topk_weights_by_lane = topk_weights[token_idx * num_topk + lane_id]
+                    __syncwarp()
+                    
+                    combined_values[kNumElemsPerInt4 * kNumRecvUnrolls] = {0.0}
+                    
+                    for i in range(num_topk):
+                        topk_idx_reg = __shfl_sync(0xffffffff, topk_idx_by_lane, i)
+                        if topk_idx_reg < 0:
+                            continue
+                        if is_rank_masked(mask_buffer_ptr, topk_idx_reg / num_local_experts):
+                            continue
+                        topk_weight = __shfl_sync(0xffffffff, topk_weights_by_lane, i)
+                        
+                        mbarrier_wait<true>(full_barriers[stage_idx], tma_phase, stage_idx)
+                        
+                        if kUseLogFMT:
+                            # LogFMT解码累加
+                            info = cast_info_buffers[stage_idx][decode_warp_idx]
+                            enable_cast = info & 1
+                            num_casted_prefix = info >> 1
+                            tma_offset = kNumLogFMTPerWarpBytes * num_casted_prefix + kNumBF16PerWarpBytes * (decode_warp_idx - num_casted_prefix)
+                            division_idx = decode_warp_idx * (kNumRecvUnrolls * 2) + lane_id * kNumRecvUnrolls / 16
+                            
+                            decode_and_accumulate<kNumRecvUnrolls>(
+                                reinterpret_cast<uint32_t*>(tma_ld_buffers[stage_idx] + tma_offset + 
+                                                            (enable_cast ? kNumLogFMTPerWarpBytes : kNumBF16PerWarpBytes) / 32 * lane_id),
+                                combined_values,
+                                log_amax_buffers[stage_idx][division_idx],
+                                log_amin_buffers[stage_idx][division_idx],
+                                enable_cast,
+                                topk_weight
+                            )
+                        else:
+                            # BF16直接累加
+                            tma_offset = kNumBF16PerWarpBytes * decode_warp_idx
+                            decode_and_accumulate<kNumRecvUnrolls>(
+                                reinterpret_cast<uint32_t*>(tma_ld_buffers[stage_idx] + tma_offset + kNumBF16PerWarpBytes / 32 * lane_id),
+                                combined_values,
+                                0, 0, false,
+                                topk_weight
+                            )
+                        
+                        if elect_one_sync():
+                            mbarrier_arrive(empty_barriers[stage_idx])
+                        stage_idx = (stage_idx + 1) % kNumStages
+                    
+                    # 写回结果
+                    tma_store_wait<0>()
+                    for k in range(kNumRecvUnrolls * 4):
+                        combined_pack = __nv_bfloat162(combined_values[k*2], combined_values[k*2 + 1])
+                        tma_st_buffers[decode_warp_idx][kNumRecvUnrolls * 4 * lane_id + k] = *reinterpret_cast<uint32_t*>(&combined_pack)
+                    tma_store_fence()
+                    if elect_one_sync():
+                        tma_store_1d(tma_st_buffers[decode_warp_idx],
+                                     combined_x + token_idx * hidden_bf16_int4 + decode_warp_idx * kNumRecvUnrolls * 32,
+                                     kNumBF16PerWarpBytes)
+                    __syncwarp()
+
+【并行模式】
+    grid: (num_sms,)
+    block: (num_warps * 32,)
+    smem: max(smem_send_size, smem_recv_size)
+    
+    发送阶段:
+        - SM级: 每个SM负责 num_warp_groups 个专家
+        - Warp级: 每个warp负责一个专家的所有tokens
+        - Sub-warp级: 每个sub-warp负责若干tokens (并行)
+        - TMA: 3-stage流水线, 1-prefetch
+    
+    接收阶段:
+        - 重新分组: num_groups个独立组
+        - 每组: 1个TMA加载warp + num_decode_warps个归约warp
+        - TMA warp: 负责读取topk专家数据
+        - 归约warp: 负责解码和topk加权累加
+        - Token级并行: SM和group双重并行
+    
+    优化:
+        - LogFMT: 在线压缩/解压, 5/8压缩率
+        - TMA异步拷贝: 隐藏内存延迟
+        - 3-stage流水线: 计算和拷贝重叠
+        - Zero-copy: 直接从dispatch缓冲区发送 (禁用LogFMT)
+
+【备注】
+    - LogFMT编码: 对数浮点10位, 只在log_amax < 0时压缩
+    - TMA: Hopper架构的Tensor Memory Accelerator
+    - m-barrier: Hopper硬件同步原语
+    - zero_copy模式: 跳过拷贝, 直接RDMA源数据 (不支持LogFMT)
+    - 接收阶段重新分组: 平衡负载, num_groups <= 2
+```
+
+### combine (host)
+
+```
+【签名】
+    @host→device
+    combine(
+        combined_x: void*,
+        rdma_recv_x: void*,
+        rdma_recv_flag: int*,
+        rdma_send_x: void*,
+        x: void*,
+        topk_idx: topk_idx_t*,
+        topk_weights: float*,
+        src_info: int*,
+        layout_range: int64_t*,
+        mask_buffer_ptr: int*,
+        combine_wait_recv_cost_stats: int64_t*,
+        next_clean: int*,
+        num_next_clean_int: int,
+        num_combined_tokens: int,
+        hidden: int,
+        num_max_dispatch_tokens_per_rank: int,
+        num_topk: int,
+        num_experts: int,
+        rank: int,
+        num_ranks: int,
+        use_logfmt: bool,
+        workspace: void*,
+        num_device_sms: int,
+        stream: cudaStream_t,
+        phases: int,
+        zero_copy: bool
+    )
+
+【算法】
+    # 计算启动配置
+    num_warp_groups = ceil_div(num_experts, num_device_sms)
+    num_warps_per_group = 32 / num_warp_groups
+    num_recv_per_sm = ceil_div(num_combined_tokens, num_device_sms)
+    num_warps = num_warp_groups * num_warps_per_group
+    num_sms = max(ceil_div(num_experts, num_warp_groups), 
+                  (num_recv_per_sm == 0) ? 1 : ceil_div(num_combined_tokens, num_recv_per_sm))
+    
+    # Workspace
+    atomic_clean_flag = workspace
+    
+    # Shared memory计算
+    kNumStages = 3
+    kNumMaxUnrolls = 4
+    kMaxNumGroups = 2
+    
+    num_meta_bytes = hidden / 128 * 4
+    num_send_tma_bytes = 32 * sizeof(int4) * kNumMaxUnrolls + 16
+    smem_send_size = num_warps * (kNumStages * num_send_tma_bytes + num_meta_bytes)
+    
+    num_recv_tma_bytes = 16 + hidden * 2
+    smem_recv_size = kMaxNumGroups * (kNumStages * num_recv_tma_bytes + hidden * 2 + kNumStages * num_meta_bytes * 3)
+    
+    smem_size = max(smem_send_size, smem_recv_size)
+    
+    # 根据hidden选择kernel
+    combine_func = (combine<true, hidden, kNumMaxTopk, kNumMaxUnrolls> if use_logfmt 
+                    else combine<false, hidden, kNumMaxTopk, kNumMaxUnrolls>)
+    
+    SET_SHARED_MEMORY_FOR_TMA(combine_func)
+    
+    LAUNCH_KERNEL(
+        grid=num_sms, block=num_warps*32, smem=smem_size, stream,
+        combine_func,
+        combined_x, rdma_recv_x, rdma_recv_flag, rdma_send_x,
+        x, topk_idx, topk_weights, src_info, layout_range,
+        mask_buffer_ptr, combine_wait_recv_cost_stats,
+        next_clean, num_next_clean_int, atomic_clean_flag,
+        num_combined_tokens, hidden, num_topk,
+        num_max_dispatch_tokens_per_rank, num_experts,
+        rank, num_ranks, num_warp_groups, num_warps_per_group,
+        phases, zero_copy
+    )
+
+【备注】
+    - 通过 SWITCH_HIDDEN 宏支持多种hidden维度
+    - Workspace需求: 1 * sizeof(int)
+    - kNumMaxTopk限制: 11
+    - zero_copy和use_logfmt不能同时启用
+```
+
+---
+
+## Mask管理函数 (故障处理)
+
+### query_mask_buffer (kernel)
+
+```
+【签名】
+    @device
+    query_mask_buffer<kNumThreads: int>(
+        mask_buffer_ptr: int*,
+        num_ranks: int,
+        mask_tensor: int*        # 输出
+    )
+
+【算法】
+    num_sms = gridDim.x
+    sm_id = blockIdx.x
+    num_threads = num_sms * kNumThreads
+    thread_id = sm_id * kNumThreads + threadIdx.x
+    
+    parallel_for rank_id in range(num_ranks):
+        mask_tensor[rank_id] = mask_buffer_ptr[rank_id]
+```
+
+### query_mask_buffer (host)
+
+```
+【签名】
+    @host→device
+    query_mask_buffer(mask_buffer_ptr: int*, num_ranks: int, mask_tensor: int*, stream: cudaStream_t)
+
+【算法】
+    LAUNCH_KERNEL(grid=1, block=1024, stream, query_mask_buffer<1024>, mask_buffer_ptr, num_ranks, mask_tensor)
+```
+
+### update_mask_buffer (kernel)
+
+```
+【签名】
+    @device
+    update_mask_buffer<kNumThreads: int>(mask_buffer_ptr: int*, rank_to_mask: int, mask: bool)
+
+【算法】
+    if blockIdx.x == 0 and threadIdx.x == 0:
+        atomicExch(mask_buffer_ptr + rank_to_mask, mask ? 1 : 0)
+```
+
+### update_mask_buffer (host)
+
+```
+【签名】
+    @host→device
+    update_mask_buffer(mask_buffer_ptr: int*, rank: int, mask: bool, stream: cudaStream_t)
+
+【算法】
+    LAUNCH_KERNEL(grid=1, block=32, stream, update_mask_buffer<32>, mask_buffer_ptr, rank, mask)
+```
+
+### clean_mask_buffer (kernel)
+
+```
+【签名】
+    @device
+    clean_mask_buffer<kNumThreads: int>(mask_buffer_ptr: int*, num_ranks: int)
+
+【算法】
+    parallel_for i in range(num_ranks):
+        mask_buffer_ptr[i] = 0
+```
+
+### clean_mask_buffer (host)
+
+```
+【签名】
+    @host→device
+    clean_mask_buffer(mask_buffer_ptr: int*, num_ranks: int, stream: cudaStream_t)
+
+【算法】
+    LAUNCH_KERNEL(grid=1, block=32, stream, clean_mask_buffer<32>, mask_buffer_ptr, num_ranks)
+```

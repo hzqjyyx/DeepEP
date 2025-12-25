@@ -1,0 +1,1152 @@
+--------------------------------
+notify_dispatch (template kernel)
+来源: csrc/kernels/intranode.cu
+--------------------------------
+
+【签名】
+    @device
+    notify_dispatch<kNumRanks>(
+        num_tokens_per_rank: Tensor[kNumRanks, int],
+        moe_recv_counter_mapped: int*,
+        num_tokens_per_expert: Tensor[kNumRanks * num_experts_per_rank, int],
+        moe_recv_expert_counter_mapped: Tensor[num_experts_per_rank, int],
+        num_experts: int,
+        num_tokens: int,
+        num_channels: int,
+        is_token_in_rank: Tensor[num_tokens, kNumRanks, bool],
+        channel_prefix_matrix: Tensor[kNumRanks, num_channels, int],
+        rank_prefix_matrix_copy: Tensor[kNumRanks, kNumRanks, int],
+        num_memset_int: int,
+        expert_alignment: int,
+        buffer_ptrs: void**,
+        barrier_signal_ptrs: int**,
+        rank: int
+    )
+
+【算法】
+    sm_id = blockIdx.x
+    thread_id = threadIdx.x
+    lane_id = thread_id % 32
+    warp_id = thread_id / 32
+
+    if sm_id == 0:
+        # === SM 0: 协调器块 ===
+        
+        # Step 1: 第一次全局屏障
+        barrier_block<kNumRanks, true>(barrier_signal_ptrs, rank)
+        
+        # Step 2: 写入本地统计到共享缓冲区
+        if thread_id < kNumRanks:
+            per_rank_buffer = buffer_ptrs[thread_id]
+            per_expert_buffer = per_rank_buffer + kNumRanks * kNumRanks
+            
+            # 写入每个rank的token数量
+            per_rank_buffer[rank * kNumRanks + thread_id] = num_tokens_per_rank[thread_id]
+            
+            # 写入每个expert的token数量
+            num_experts_per_rank = num_experts / kNumRanks
+            for i in range(num_experts_per_rank):
+                per_expert_buffer[rank * num_experts_per_rank + i] = 
+                    num_tokens_per_expert[thread_id * num_experts_per_rank + i]
+        
+        # Step 3: 第二次屏障，等待所有rank写入完成
+        barrier_block<kNumRanks>(barrier_signal_ptrs, rank)
+        
+        # Step 4: 计算前缀和并返回给CPU
+        local_per_rank_buffer = buffer_ptrs[rank]
+        if thread_id < kNumRanks:
+            # 沿第一维累加（prefix sum）
+            for i in range(1, kNumRanks):
+                local_per_rank_buffer[i * kNumRanks + thread_id] += 
+                    local_per_rank_buffer[(i-1) * kNumRanks + thread_id]
+            
+            # 对角线元素是本rank的总接收量
+            if thread_id == rank:
+                *moe_recv_counter_mapped = local_per_rank_buffer[(kNumRanks-1) * kNumRanks + rank]
+        
+        # Step 5: 计算每个expert接收的token总数（对齐）
+        local_per_expert_buffer = local_per_rank_buffer + kNumRanks * kNumRanks
+        if thread_id < num_experts_per_rank:
+            sum = 0
+            for i in range(kNumRanks):
+                sum += local_per_expert_buffer[i * num_experts_per_rank + thread_id]
+            # 向上对齐到expert_alignment
+            sum = (sum + expert_alignment - 1) / expert_alignment * expert_alignment
+            moe_recv_expert_counter_mapped[thread_id] = sum
+        
+        __syncthreads()
+        
+        # Step 6: 拷贝前缀和矩阵到另一个tensor
+        for i in thread_id; i < kNumRanks * kNumRanks; i += num_threads:
+            rank_prefix_matrix_copy[i] = local_per_rank_buffer[i]
+        
+        # Step 7: 清空后续通信队列
+        for i in thread_id; i < num_memset_int; i += num_threads:
+            local_per_expert_buffer[i] = 0
+        
+        # Step 8: 第三次屏障
+        barrier_block<kNumRanks>(barrier_signal_ptrs, rank)
+    
+    else:
+        # === SM 1~kNumRanks: 数据分发块 ===
+        
+        dst_rank = sm_id - 1
+        
+        # Step 1: 每个warp处理若干channel，统计发往dst_rank的token数
+        for channel_id in warp_id; channel_id < num_channels; channel_id += num_warps:
+            token_start_idx, token_end_idx = get_channel_task_range(num_tokens, num_channels, channel_id)
+            
+            # 统计该channel中发往dst_rank的token数
+            count = 0
+            for i in token_start_idx + lane_id; i < token_end_idx; i += 32:
+                count += is_token_in_rank[i * kNumRanks + dst_rank]
+            
+            count = warp_reduce_sum(count)
+            
+            if elect_one_sync():
+                channel_prefix_matrix[dst_rank * num_channels + channel_id] = count
+        
+        __syncthreads()
+        
+        # Step 2: 计算channel维度的前缀和
+        if thread_id == 0:
+            for i in range(1, num_channels):
+                channel_prefix_matrix[dst_rank * num_channels + i] += 
+                    channel_prefix_matrix[dst_rank * num_channels + i - 1]
+
+【并行模式】
+    grid: (1 + kNumRanks, kNumThreads=128)
+    
+    SM 0 (协调器):
+        - 线程 0~kNumRanks-1: 写入per-rank统计、计算前缀和、计算per-expert统计
+        - 所有线程: 拷贝前缀和矩阵、清空缓冲区
+        - 3次全局屏障同步所有rank
+    
+    SM 1~kNumRanks (分发器):
+        - 每个SM负责一个dst_rank
+        - warp级并行: 统计每个channel中发往dst_rank的token数
+        - warp_reduce_sum: 归约warp内统计
+        - 单线程: 计算channel前缀和
+
+【备注】
+    - barrier_block: NVSHMEM/自定义的多rank屏障同步
+    - get_channel_task_range: 计算channel负责的token范围
+    - buffer_ptrs: 共享内存区域，布局为 [kNumRanks][per_rank_buffer + per_expert_buffer]
+
+
+--------------------------------
+notify_dispatch (host launcher)
+来源: csrc/kernels/intranode.cu
+--------------------------------
+
+【签名】
+    @host→device
+    notify_dispatch(
+        num_tokens_per_rank: Tensor[num_ranks, int],
+        moe_recv_counter_mapped: int*,
+        num_ranks: int,
+        num_tokens_per_expert: Tensor[num_experts, int],
+        moe_recv_expert_counter_mapped: Tensor[num_experts/num_ranks, int],
+        num_experts: int,
+        num_tokens: int,
+        is_token_in_rank: Tensor[num_tokens, num_ranks, bool],
+        channel_prefix_matrix: Tensor[num_ranks, num_channels, int],
+        rank_prefix_matrix_copy: Tensor[num_ranks, num_ranks, int],
+        num_memset_int: int,
+        expert_alignment: int,
+        buffer_ptrs: void**,
+        barrier_signal_ptrs: int**,
+        rank: int,
+        stream: cudaStream_t,
+        num_channels: int
+    )
+
+【算法】
+    constexpr kNumThreads = 128
+    
+    # 运行时断言
+    assert num_experts % num_ranks == 0
+    assert num_experts / num_ranks <= kNumThreads and num_ranks <= kNumThreads
+    
+    # 配置启动参数
+    cfg = SETUP_LAUNCH_CONFIG(1 + num_ranks, kNumThreads, stream)
+    
+    # 根据num_ranks分发到模板实例
+    SWITCH_RANKS(NOTIFY_DISPATCH_LAUNCH_CASE):
+        LAUNCH_KERNEL(&cfg, notify_dispatch<ranks>, ...)
+
+
+--------------------------------
+cached_notify_dispatch (template kernel)
+来源: csrc/kernels/intranode.cu
+--------------------------------
+
+【签名】
+    @device
+    cached_notify_dispatch<kNumRanks>(
+        rank_prefix_matrix: Tensor[kNumRanks, kNumRanks, int],
+        num_memset_int: int,
+        buffer_ptrs: void**,
+        barrier_signal_ptrs: int**,
+        rank: int
+    )
+
+【算法】
+    # 简化版本，用于缓存的handle（固定的分发模式）
+    
+    # Step 1: 第一次屏障
+    barrier_block<kNumRanks, true>(barrier_signal_ptrs, rank)
+    
+    thread_id = threadIdx.x
+    ptr = buffer_ptrs[rank]
+    
+    # Step 2: 拷贝前缀和矩阵
+    for i in thread_id; i < kNumRanks * kNumRanks; i += num_threads:
+        ptr[i] = rank_prefix_matrix[i]
+    
+    # Step 3: 清空通信队列元数据
+    for i in thread_id; i < num_memset_int; i += num_threads:
+        ptr[kNumRanks * kNumRanks + i] = 0
+    
+    # Step 4: 第二次屏障
+    barrier_block<kNumRanks>(barrier_signal_ptrs, rank)
+
+【并行模式】
+    grid: (1, 128)
+    block: 所有线程并行拷贝和清空
+
+【备注】
+    - 与notify_dispatch相比，跳过了统计和前缀和计算，直接使用预先计算好的rank_prefix_matrix
+
+
+--------------------------------
+dispatch (template kernel)
+来源: csrc/kernels/intranode.cu
+--------------------------------
+
+【签名】
+    @device
+    dispatch<kNumRanks, kNumThreads=768, kNumTMABytesPerWarp=8192>(
+        recv_x: Tensor[num_recv_tokens, hidden_int4, int4],
+        recv_x_scales: Tensor[num_recv_tokens, num_scales, float],
+        recv_src_idx: Tensor[num_recv_tokens, int],
+        recv_topk_idx: Tensor[num_recv_tokens, num_topk, topk_idx_t],
+        recv_topk_weights: Tensor[num_recv_tokens, num_topk, float],
+        recv_channel_offset: Tensor[kNumRanks, num_channels, int],
+        send_head: Tensor[num_tokens, kNumRanks, int],
+        x: Tensor[num_tokens, hidden_int4, int4],
+        x_scales: Tensor[num_tokens, num_scales, float],
+        topk_idx: Tensor[num_tokens, num_topk, topk_idx_t],
+        topk_weights: Tensor[num_tokens, num_topk, float],
+        is_token_in_rank: Tensor[num_tokens, kNumRanks, bool],
+        channel_prefix_matrix: Tensor[kNumRanks, num_channels, int],
+        num_tokens: int,
+        num_worst_tokens: int,
+        hidden_int4: int,
+        num_topk: int,
+        num_experts: int,
+        num_scales: int,
+        scale_token_stride: int,
+        scale_hidden_stride: int,
+        buffer_ptrs: void**,
+        rank: int,
+        num_max_send_tokens: int,
+        num_recv_buffer_tokens: int
+    )
+
+【算法】
+    sm_id = blockIdx.x
+    thread_id = threadIdx.x
+    lane_id = get_lane_id()
+    num_sms = gridDim.x
+    num_channels = num_sms / 2
+    
+    # 关键分工: 偶数SM发送，奇数SM接收
+    is_sender = (sm_id % 2 == 0)
+    responsible_channel = sm_id / 2
+    
+    num_threads_per_rank = kNumThreads / kNumRanks
+    responsible_rank = thread_id / num_threads_per_rank
+    
+    # === 计算缓冲区指针 ===
+    ptr = buffer_ptrs[is_sender ? responsible_rank : rank] + kNumRanks * kNumRanks * sizeof(int)
+    target_rank = is_sender ? rank : responsible_rank
+    channel_rank_offset = responsible_channel * kNumRanks + target_rank
+    
+    # 缓冲区布局 (存储在接收方):
+    # - channel_start_offset: Tensor[num_channels * kNumRanks, int]
+    # - channel_end_offset: Tensor[num_channels * kNumRanks, int]
+    # - channel_head_idx: Tensor[num_channels * kNumRanks, int]
+    # - channel_tail_idx: Tensor[num_channels * kNumRanks, int]
+    # - channel_x_buffers: Tensor[num_channels * kNumRanks, num_recv_buffer_tokens, hidden_int4, int4]
+    # - channel_src_idx_buffers: Tensor[num_channels * kNumRanks, num_recv_buffer_tokens, int]
+    # - channel_topk_idx_buffers: Tensor[num_channels * kNumRanks, num_recv_buffer_tokens, num_topk, topk_idx_t]
+    # - channel_topk_weights_buffers: Tensor[num_channels * kNumRanks, num_recv_buffer_tokens, num_topk, float]
+    # - channel_x_scales_buffers: Tensor[num_channels * kNumRanks, num_recv_buffer_tokens, num_scales, float]
+    
+    channel_start_offset = Buffer<int>(ptr, num_channels_total, channel_rank_offset)
+    channel_end_offset = Buffer<int>(ptr, num_channels_total, channel_rank_offset)
+    channel_head_idx = Buffer<int>(ptr, num_channels_total, channel_rank_offset)
+    channel_tail_idx = Buffer<int>(ptr, num_channels_total, channel_rank_offset)
+    channel_x_buffers = Buffer<int4>(ptr, num_channels_total * num_recv_buffer_tokens * hidden_int4, ...)
+    channel_src_idx_buffers = Buffer<int>(ptr, num_channels_total * num_recv_buffer_tokens, ...)
+    channel_topk_idx_buffers = Buffer<topk_idx_t>(ptr, num_channels_total * num_recv_buffer_tokens * num_topk, ...)
+    channel_topk_weights_buffers = Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_topk, ...)
+    channel_x_scales_buffers = Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_scales, ...)
+    
+    # === TMA初始化 (仅SM90) ===
+    if not DISABLE_SM90_FEATURES:
+        half_hidden_int4 = hidden_int4 / 2
+        half_hidden_bytes = half_hidden_int4 * sizeof(int4)
+        tma_buffer = smem_buffer + (thread_id / 32) * kNumTMABytesPerWarp
+        tma_mbarrier = (uint64_t*)(tma_buffer + half_hidden_bytes)
+        tma_phase = 0
+        
+        if elect_one_sync():
+            mbarrier_init(tma_mbarrier, 1)
+            fence_barrier_init()
+    
+    if is_sender:
+        # === 发送方 ===
+        
+        send_warp_id_in_rank = (thread_id % num_threads_per_rank) / 32
+        
+        # Step 1: 通知接收方channel范围（编码为负数以区分0）
+        if send_warp_id_in_rank == 0 and elect_one_sync():
+            value = (responsible_channel > 0) ? 
+                channel_prefix_matrix[responsible_rank * num_channels + responsible_channel - 1] : 0
+            st_relaxed_sys_global(channel_start_offset.buffer(), -value - 1)
+            
+            value = channel_prefix_matrix[responsible_rank * num_channels + responsible_channel]
+            st_relaxed_sys_global(channel_end_offset.buffer(), -value - 1)
+        
+        __syncwarp()
+        
+        # Step 2: 获取本channel负责的token范围
+        token_start_idx, token_end_idx = get_channel_task_range(num_tokens, num_channels, responsible_channel)
+        
+        # Step 3: 迭代发送token
+        cached_channel_tail_idx = 0
+        for token_idx in range(token_start_idx, token_end_idx):
+            # Step 3.1: 检查接收队列是否有空间（罕见情况会等待）
+            start_time = clock64()
+            if elect_one_sync():
+                while true:
+                    num_used_slots = cached_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer())
+                    if num_recv_buffer_tokens - num_used_slots >= num_max_send_tokens:
+                        break
+                    
+                    if clock64() - start_time > NUM_TIMEOUT_CYCLES:
+                        printf("DeepEP timeout for dispatch senders, rank %d, responsible_channel = %d\n", 
+                               rank, responsible_channel)
+                        trap()
+            
+            __syncwarp()
+            
+            # Step 3.2: 发送一批token
+            chunk_token_idx = 0
+            while chunk_token_idx < num_max_send_tokens and token_idx < token_end_idx:
+                # 记录发送头位置（或-1表示未选中）
+                if token_idx % num_send_warps_per_rank == send_warp_id_in_rank and elect_one_sync():
+                    send_head[token_idx * kNumRanks + responsible_rank] = 
+                        is_token_in_rank[token_idx * kNumRanks + responsible_rank] ? 
+                        cached_channel_tail_idx : -1
+                
+                if not is_token_in_rank[token_idx * kNumRanks + responsible_rank]:
+                    token_idx++
+                    continue
+                
+                # 获取循环队列中的空闲槽位
+                dst_slot_idx = (cached_channel_tail_idx++) % num_recv_buffer_tokens
+                
+                if cached_channel_tail_idx % num_send_warps_per_rank == send_warp_id_in_rank:
+                    # 拷贝x数据（warp级拷贝）
+                    shifted_channel_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4
+                    shifted_x = x + token_idx * hidden_int4
+                    UNROLLED_WARP_COPY(5, lane_id, hidden_int4, 
+                                      shifted_channel_x_buffers, shifted_x, __ldg, st_na_global)
+                    
+                    # 拷贝源索引
+                    if elect_one_sync():
+                        channel_src_idx_buffers[dst_slot_idx] = token_idx
+                    
+                    # 拷贝并转换topk_idx（转为本地expert索引）
+                    if lane_id < num_topk:
+                        recv_expert_begin = responsible_rank * num_experts_per_rank
+                        recv_expert_end = (responsible_rank + 1) * num_experts_per_rank
+                        idx_value = __ldg(topk_idx + token_idx * num_topk + lane_id)
+                        idx_value = (idx_value >= recv_expert_begin and idx_value < recv_expert_end) ? 
+                                    idx_value - recv_expert_begin : -1
+                        channel_topk_idx_buffers[dst_slot_idx * num_topk + lane_id] = idx_value
+                        
+                        weight_value = __ldg(topk_weights + token_idx * num_topk + lane_id)
+                        weight_value = (idx_value >= 0) ? weight_value : 0.0f
+                        channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id] = weight_value
+                    
+                    # 拷贝x_scales
+                    for i in lane_id; i < num_scales; i += 32:
+                        offset = token_idx * scale_token_stride + i * scale_hidden_stride
+                        channel_x_scales_buffers[dst_slot_idx * num_scales + i] = __ldg(x_scales + offset)
+                
+                chunk_token_idx++
+                token_idx++
+            
+            # Step 3.3: 更新tail索引（release语义通知接收方）
+            asm volatile("bar.sync %0, %1;" :: "r"(responsible_rank), "r"(num_threads_per_rank))
+            if send_warp_id_in_rank == 0 and elect_one_sync():
+                st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx)
+    
+    else:
+        # === 接收方 ===
+        
+        recv_thread_id_in_rank = thread_id % num_threads_per_rank
+        recv_warp_id_in_rank = recv_thread_id_in_rank / 32
+        
+        # Step 1: 计算偏移量
+        rank_prefix_matrix = buffer_ptrs[rank]
+        rank_offset = (responsible_rank > 0) ? 
+            rank_prefix_matrix[(responsible_rank - 1) * kNumRanks + rank] : 0
+        
+        # Step 2: 等待发送方通知channel范围
+        if elect_one_sync():
+            while (total_offset = ld_volatile_global(channel_start_offset.buffer())) == 0:
+                pass
+            while (num_tokens_to_recv = ld_volatile_global(channel_end_offset.buffer())) == 0:
+                pass
+            
+            # 解码负数编码
+            total_offset = -total_offset - 1
+            num_tokens_to_recv = -num_tokens_to_recv - 1
+            
+            if recv_warp_id_in_rank == 0:
+                recv_channel_offset[responsible_rank * num_channels + responsible_channel] = total_offset
+            
+            num_tokens_to_recv -= total_offset
+        
+        total_offset = __shfl_sync(0xffffffff, total_offset, 0)
+        total_offset += rank_offset
+        num_tokens_to_recv = __shfl_sync(0xffffffff, num_tokens_to_recv, 0)
+        
+        # Step 3: 接收循环
+        __shared__ volatile int shared_channel_tail_idx[kNumRanks]
+        start_time = clock64()
+        cached_channel_head_idx = 0
+        cached_channel_tail_idx = 0
+        
+        while num_tokens_to_recv > 0:
+            # Step 3.1: 等待新数据到达（acquire语义）
+            while recv_thread_id_in_rank == 0:
+                cached_channel_tail_idx = ld_acquire_sys_global(channel_tail_idx.buffer())
+                
+                if cached_channel_head_idx != cached_channel_tail_idx:
+                    shared_channel_tail_idx[responsible_rank] = cached_channel_tail_idx
+                    break
+                
+                if clock64() - start_time > NUM_TIMEOUT_CYCLES:
+                    printf("DeepEP timeout for dispatch receivers, rank %d, responsible_channel = %d, tokens remained: %d\n",
+                           rank, responsible_channel, num_tokens_to_recv)
+                    trap()
+            
+            # Step 3.2: 同步tail索引
+            asm volatile("bar.sync %0, %1;" :: "r"(responsible_rank), "r"(num_threads_per_rank))
+            cached_channel_tail_idx = shared_channel_tail_idx[responsible_rank]
+            
+            # Step 3.3: 拷贝数据
+            num_recv_tokens = cached_channel_tail_idx - cached_channel_head_idx
+            
+            # 拷贝x数据（TMA或warp拷贝）
+            for chunk_idx in recv_warp_id_in_rank; chunk_idx < num_recv_tokens; chunk_idx += num_recv_warps_per_rank:
+                token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens
+                shifted_buffer_x_int4 = channel_x_buffers.buffer() + token_idx_in_buffer * hidden_int4
+                shifted_recv_x_int4 = recv_x + (total_offset + chunk_idx) * hidden_int4
+                
+                if not DISABLE_SM90_FEATURES:
+                    # TMA路径：双缓冲加载+存储
+                    for i in range(2):
+                        tma_store_wait<0>()
+                        if elect_one_sync():
+                            tma_load_1d(tma_buffer, shifted_buffer_x_int4 + i * half_hidden_int4, 
+                                       tma_mbarrier, half_hidden_bytes)
+                            mbarrier_arrive_and_expect_tx(tma_mbarrier, half_hidden_bytes)
+                            mbarrier_wait(tma_mbarrier, tma_phase)
+                            tma_store_1d(tma_buffer, shifted_recv_x_int4 + i * half_hidden_int4, 
+                                        half_hidden_bytes, false)
+                    __syncwarp()
+                else:
+                    # 常规warp拷贝
+                    UNROLLED_WARP_COPY(5, lane_id, hidden_int4, 
+                                      shifted_recv_x_int4, shifted_buffer_x_int4, 
+                                      ld_nc_global, st_na_global)
+            
+            # 拷贝src_idx
+            for chunk_idx in cached_channel_head_idx + recv_thread_id_in_rank; 
+                chunk_idx < cached_channel_tail_idx; 
+                chunk_idx += 32 * num_recv_warps_per_rank:
+                recv_src_idx[total_offset + chunk_idx - cached_channel_head_idx] = 
+                    ld_nc_global(channel_src_idx_buffers.buffer() + chunk_idx % num_recv_buffer_tokens)
+            
+            # 拷贝topk_idx和topk_weights
+            for idx in recv_thread_id_in_rank; idx < num_recv_tokens * num_topk; idx += 32 * num_recv_warps_per_rank:
+                chunk_idx = idx / num_topk
+                token_topk_idx = idx % num_topk
+                token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens
+                recv_idx = (total_offset + chunk_idx) * num_topk + token_topk_idx
+                buffer_idx = token_idx_in_buffer * num_topk + token_topk_idx
+                recv_topk_idx[recv_idx] = ld_nc_global(channel_topk_idx_buffers.buffer() + buffer_idx)
+                recv_topk_weights[recv_idx] = ld_nc_global(channel_topk_weights_buffers.buffer() + buffer_idx)
+            
+            # 拷贝x_scales
+            for i in recv_thread_id_in_rank; i < num_recv_tokens * num_scales; i += 32 * num_recv_warps_per_rank:
+                chunk_idx = i / num_scales
+                scales_idx = i % num_scales
+                token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens
+                recv_x_scales[(total_offset + chunk_idx) * num_scales + scales_idx] = 
+                    ld_nc_global(channel_x_scales_buffers.buffer() + token_idx_in_buffer * num_scales + scales_idx)
+            
+            # Step 3.4: 更新head索引（relaxed语义通知发送方）
+            cached_channel_head_idx += num_recv_tokens
+            total_offset += num_recv_tokens
+            asm volatile("bar.sync %0, %1;" :: "r"(responsible_rank), "r"(num_threads_per_rank))
+            if recv_warp_id_in_rank == num_recv_warps_per_rank - 1 and elect_one_sync():
+                st_relaxed_sys_global(channel_head_idx.buffer(), cached_channel_head_idx)
+            
+            num_tokens_to_recv -= num_recv_tokens
+    
+    # === 清理未使用的recv_topk_idx ===
+    if num_worst_tokens > 0:
+        rank_prefix_matrix = buffer_ptrs[rank]
+        num_recv_tokens = rank_prefix_matrix[(kNumRanks - 1) * kNumRanks + rank]
+        clean_start = num_recv_tokens * num_topk + sm_id * kNumThreads
+        clean_end = num_worst_tokens * num_topk
+        clean_stride = num_sms * kNumThreads
+        
+        for i in clean_start + thread_id; i < clean_end; i += clean_stride:
+            recv_topk_idx[i] = -1
+
+【并行模式】
+    grid: (2 * num_channels, kNumThreads=768)
+    
+    偶数SM (发送方):
+        - 每个SM负责一个目标rank
+        - kNumThreads线程按rank分组: kNumThreads / kNumRanks 个线程负责一个rank
+        - 每组内再分warp: 负责不同token的数据拷贝
+        - 循环队列: 使用channel_tail_idx作为生产者游标
+        - 同步: warp级同步 + rank级barrier
+    
+    奇数SM (接收方):
+        - 每个SM负责一个源rank
+        - 线程按rank分组，每组内多个warp并行接收
+        - 循环队列: 使用channel_head_idx作为消费者游标
+        - 同步: 线程0轮询tail更新，barrier同步后其他线程拷贝
+        - TMA (SM90): 单线程发起TMA load/store，warp同步
+    
+    优化:
+        - UNROLLED_WARP_COPY: 展开的warp级拷贝宏
+        - TMA双缓冲: 分两次拷贝hidden维度，减少单次TMA大小
+        - 循环队列: 减少内存分配，支持流式处理
+        - acquire/release语义: 保证跨GPU内存一致性
+
+【备注】
+    - 偶数/奇数SM分离: 避免死锁，实现生产者-消费者模式
+    - 负数编码: -value-1 用于区分真实的0和未初始化状态
+    - topk_idx转换: 全局expert索引转为接收rank的本地索引
+    - 超时检测: NUM_TIMEOUT_CYCLES，防止死锁时无限等待
+    - 依赖buffer_ptrs布局: 前面是rank_prefix_matrix，后面是channel通信缓冲区
+
+
+--------------------------------
+dispatch (host launcher)
+来源: csrc/kernels/intranode.cu
+--------------------------------
+
+【签名】
+    @host→device
+    dispatch(
+        recv_x: void*,
+        recv_x_scales: float*,
+        recv_src_idx: int*,
+        recv_topk_idx: topk_idx_t*,
+        recv_topk_weights: float*,
+        recv_channel_offset: int*,
+        send_head: int*,
+        x: void*,
+        x_scales: float*,
+        topk_idx: topk_idx_t*,
+        topk_weights: float*,
+        is_token_in_rank: bool*,
+        channel_prefix_matrix: int*,
+        num_tokens: int,
+        num_worst_tokens: int,
+        hidden_int4: int,
+        num_topk: int,
+        num_experts: int,
+        num_scales: int,
+        scale_token_stride: int,
+        scale_hidden_stride: int,
+        buffer_ptrs: void**,
+        rank: int,
+        num_ranks: int,
+        stream: cudaStream_t,
+        num_sms: int,
+        num_max_send_tokens: int,
+        num_recv_buffer_tokens: int
+    )
+
+【算法】
+    constexpr kNumThreads = 768
+    constexpr kNumTMABytesPerWarp = 8192
+    
+    # 边界检查
+    assert num_scales * scale_hidden_stride < INT_MAX
+    assert num_sms % 2 == 0
+    
+    # 配置启动参数
+    cfg = SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream)
+    
+    # SM90设置共享内存
+    if not DISABLE_SM90_FEATURES:
+        kernel = dispatch<ranks, kNumThreads, kNumTMABytesPerWarp>
+        SET_SHARED_MEMORY_FOR_TMA(kernel)
+    
+    # 根据num_ranks分发到模板实例
+    SWITCH_RANKS(DISPATCH_LAUNCH_CASE):
+        LAUNCH_KERNEL(&cfg, kernel, reinterpret_cast<int4*>(recv_x), ...)
+
+
+--------------------------------
+cached_notify_combine (template kernel)
+来源: csrc/kernels/intranode.cu
+--------------------------------
+
+【签名】
+    @device
+    cached_notify_combine<kNumRanks>(
+        buffer_ptrs: void**,
+        send_head: Tensor[num_recv_tokens, kNumRanks, int],
+        num_channels: int,
+        num_recv_tokens: int,
+        num_memset_int: int,
+        barrier_signal_ptrs: int**,
+        rank: int
+    )
+
+【算法】
+    sm_id = blockIdx.x
+    
+    if sm_id == 0:
+        # === SM 0: 清理协调器 ===
+        
+        # Step 1: 屏障前清理
+        barrier_block<kNumRanks, true>(barrier_signal_ptrs, rank)
+        
+        # Step 2: 清空缓冲区
+        thread_id = threadIdx.x
+        ptr = buffer_ptrs[rank]
+        for i in thread_id; i < num_memset_int; i += num_threads:
+            ptr[i] = 0
+        
+        # Step 3: 屏障后清理
+        barrier_block<kNumRanks>(barrier_signal_ptrs, rank)
+    
+    else:
+        # === SM 1~num_channels: head索引重建 ===
+        
+        channel_id = sm_id - 1
+        thread_id = threadIdx.x
+        rank_id = thread_id / 32
+        lane_id = thread_id % 32
+        
+        if rank_id >= kNumRanks:
+            return
+        
+        # 获取本channel负责的token范围
+        token_start_idx, token_end_idx = get_channel_task_range(num_recv_tokens, num_channels, channel_id)
+        
+        # Step 1: 从后向前扫描，重建缺失的head索引
+        last_head = 1 << 25  # 启发式大数
+        
+        for token_idx_tail in token_end_idx - 1; token_idx_tail >= token_start_idx; token_idx_tail -= 32:
+            token_idx = token_idx_tail - lane_id
+            current_head = (token_idx >= token_start_idx) ? 
+                __ldg(send_head + token_idx * kNumRanks + rank_id) : -1
+            
+            expected_head = 0
+            
+            # warp内协作: 找到最近的有效head
+            for i in range(min(32, token_idx_tail - token_start_idx + 1)):
+                head = __shfl_sync(0xffffffff, current_head, i)
+                if head < 0:
+                    if lane_id == i:
+                        expected_head = -last_head - 1
+                else:
+                    last_head = head
+            
+            # 填充缺失的head（编码为负数）
+            if current_head < 0 and token_idx >= token_start_idx:
+                send_head[token_idx * kNumRanks + rank_id] = expected_head
+
+【并行模式】
+    grid: (1 + num_channels, max(128, 32 * num_ranks))
+    
+    SM 0 (清理器):
+        - 所有线程并行清空缓冲区
+        - 双屏障同步所有rank
+    
+    SM 1~num_channels (head重建器):
+        - 每个SM负责一个channel
+        - 线程按rank分组: 每32个线程(一个warp)负责一个rank
+        - 从后向前扫描: 利用warp shuffle填充缺失的head索引
+    
+    优化:
+        - warp级协作: shuffle传播last_head信息
+        - 负数编码: 区分原始head和插值head
+
+【备注】
+    - 用于combine阶段前的准备工作
+    - send_head中-1表示token未发送到该rank，需要从后面的有效head反推
+    - 反推逻辑: 如果token i未发送，它的"期望head"是下一个发送token的head（编码为负）
+
+
+--------------------------------
+combine (template kernel)
+来源: csrc/kernels/intranode.cu
+--------------------------------
+
+【签名】
+    @device
+    combine<dtype_t, kNumRanks, kNumThreads=768, kNumTMABytesPerWarp=4096>(
+        recv_x: Tensor[num_tokens, hidden, dtype_t],
+        recv_topk_weights: Tensor[num_tokens, num_topk, float],
+        x: Tensor[num_recv_tokens, hidden, dtype_t],
+        topk_weights: Tensor[num_recv_tokens, num_topk, float],
+        bias_0: Optional[Tensor[num_tokens, hidden, dtype_t]],
+        bias_1: Optional[Tensor[num_tokens, hidden, dtype_t]],
+        src_idx: Tensor[num_recv_tokens, int],
+        rank_prefix_matrix: Tensor[kNumRanks, kNumRanks, int],
+        channel_prefix_matrix: Tensor[kNumRanks, num_channels, int],
+        send_head: Tensor[num_tokens, kNumRanks, int],
+        num_tokens: int,
+        num_recv_tokens: int,
+        hidden: int,
+        num_topk: int,
+        buffer_ptrs: void**,
+        rank: int,
+        num_max_send_tokens: int,
+        num_recv_buffer_tokens: int
+    )
+
+【算法】
+    sm_id = blockIdx.x
+    thread_id = threadIdx.x
+    lane_id = get_lane_id()
+    num_sms = gridDim.x
+    num_channels = num_sms / 2
+    
+    is_sender = (sm_id % 2 == 0)
+    responsible_channel = sm_id / 2
+    
+    constexpr kDtypePerInt4 = sizeof(int4) / sizeof(dtype_t)
+    hidden_int4 = hidden * sizeof(dtype_t) / sizeof(int4)
+    hidden_int4_aligned = align_down(hidden_int4, 32)
+    
+    x_int4 = reinterpret_cast<int4*>(x)
+    bias_0_int4 = reinterpret_cast<int4*>(bias_0)
+    bias_1_int4 = reinterpret_cast<int4*>(bias_1)
+    recv_int4 = reinterpret_cast<int4*>(recv_x)
+    
+    # TMA初始化 (仅SM90)
+    if not DISABLE_SM90_FEATURES:
+        tma_buffer = smem_buffer + (thread_id / 32) * kNumTMABytesPerWarp
+    
+    if is_sender:
+        # === 发送方: 重新分发expert输出 ===
+        
+        num_send_warps_per_rank = (kNumThreads / 32) / kNumRanks
+        num_threads_per_rank = num_send_warps_per_rank * 32
+        send_warp_id = thread_id / 32
+        send_rank_id = (responsible_channel + send_warp_id) % kNumRanks
+        send_warp_id_in_rank = send_warp_id / kNumRanks
+        
+        # 计算缓冲区指针
+        ptr = buffer_ptrs[send_rank_id]
+        channel_rank_offset = responsible_channel * kNumRanks + rank
+        
+        # 缓冲区布局 (存储在发送方):
+        # - channel_head_idx: Tensor[num_channels * kNumRanks, int]
+        # - channel_tail_idx: Tensor[num_channels * kNumRanks, int]
+        # - channel_x_buffers: Tensor[num_channels * kNumRanks, num_recv_buffer_tokens, hidden_int4, int4]
+        # - channel_src_idx_buffers: Tensor[num_channels * kNumRanks, num_recv_buffer_tokens, int]
+        # - channel_topk_weights_buffers: Tensor[num_channels * kNumRanks, num_recv_buffer_tokens, num_topk, float]
+        
+        channel_head_idx = Buffer<int>(ptr, num_channels_total, channel_rank_offset)
+        channel_tail_idx = Buffer<int>(ptr, num_channels_total, channel_rank_offset)
+        channel_x_buffers = Buffer<int4>(ptr, num_channels_total * num_recv_buffer_tokens * hidden_int4, ...)
+        channel_src_idx_buffers = Buffer<int>(ptr, num_channels_total * num_recv_buffer_tokens, ...)
+        channel_topk_weights_buffers = Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_topk, ...)
+        
+        # 计算本channel负责的token范围
+        rank_offset = (send_rank_id > 0) ? rank_prefix_matrix[(send_rank_id - 1) * kNumRanks + rank] : 0
+        num_rank_tokens = rank_prefix_matrix[send_rank_id * kNumRanks + rank] - rank_offset
+        channel_offset = channel_prefix_matrix[send_rank_id * num_channels + responsible_channel]
+        num_channel_tokens = (responsible_channel == num_channels - 1) ? 
+            num_rank_tokens : 
+            channel_prefix_matrix[send_rank_id * num_channels + responsible_channel + 1] - channel_offset
+        
+        token_start_idx = rank_offset + channel_offset
+        token_end_idx = rank_offset + channel_offset + num_channel_tokens
+        
+        # 迭代发送token
+        current_channel_tail_idx = 0
+        for token_idx in range(token_start_idx, token_end_idx):
+            # Step 1: 检查接收队列空间
+            start_time = clock64()
+            num_round_tokens = min(num_max_send_tokens, token_end_idx - token_idx)
+            
+            if elect_one_sync():
+                while true:
+                    num_used_slots = current_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer())
+                    if num_recv_buffer_tokens - num_used_slots >= num_round_tokens:
+                        break
+                    
+                    if clock64() - start_time > NUM_TIMEOUT_CYCLES:
+                        printf("DeepEP timeout for combine senders, rank %d, responsible_channel = %d\n",
+                               rank, responsible_channel)
+                        trap()
+            
+            __syncwarp()
+            
+            # Step 2: 批量发送
+            for i in send_warp_id_in_rank; i < num_round_tokens; i += num_send_warps_per_rank:
+                dst_slot_idx = (current_channel_tail_idx + i) % num_recv_buffer_tokens
+                
+                # 拷贝x数据
+                shifted_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4
+                shifted_x = x_int4 + (token_idx + i) * hidden_int4
+                UNROLLED_WARP_COPY(4, lane_id, hidden_int4, shifted_x_buffers, shifted_x, ld_nc_global, st_na_global)
+                
+                # 拷贝src_idx
+                if elect_one_sync():
+                    channel_src_idx_buffers[dst_slot_idx] = __ldg(src_idx + token_idx + i)
+                
+                # 拷贝topk_weights
+                if num_topk > 0 and lane_id < num_topk:
+                    channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id] = 
+                        __ldg(topk_weights + (token_idx + i) * num_topk + lane_id)
+            
+            token_idx += num_round_tokens
+            current_channel_tail_idx += num_round_tokens
+            
+            # Step 3: 更新tail索引
+            asm volatile("bar.sync %0, %1;" :: "r"(send_rank_id), "r"(num_threads_per_rank))
+            if send_warp_id_in_rank == 0 and elect_one_sync():
+                st_release_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx)
+    
+    else:
+        # === 接收方: 聚合多个rank的结果 ===
+        
+        num_recv_warps = kNumThreads / 32
+        recv_warp_id = thread_id / 32
+        
+        # 共享内存: 追踪每个warp对每个rank的head位置
+        __shared__ volatile int warp_channel_head_idx[num_recv_warps][kNumRanks]
+        __shared__ volatile int channel_tail_idx[kNumRanks]
+        __shared__ volatile bool warp_retired[num_recv_warps]
+        
+        if thread_id < num_recv_warps:
+            warp_retired[thread_id] = false
+        if lane_id < kNumRanks:
+            warp_channel_head_idx[recv_warp_id][lane_id] = 0
+        if thread_id < kNumRanks:
+            channel_tail_idx[thread_id] = 0
+        
+        asm volatile("bar.sync 0, %0;" :: "r"(kNumThreads))
+        
+        if thread_id < 32:
+            # === Warp 0: 队列head更新器 ===
+            
+            channel_head_idx_ptr = buffer_ptrs[rank] + responsible_channel * kNumRanks + lane_id
+            channel_tail_idx_ptr = channel_head_idx_ptr + num_channels * kNumRanks
+            
+            last_head = 0
+            while lane_id < kNumRanks:
+                # 检查所有worker warp是否退出
+                retired = true
+                for i in range(1, num_recv_warps):
+                    retired = retired and warp_retired[i]
+                if retired:
+                    break
+                
+                # 更新tail索引
+                channel_tail_idx[lane_id] = ld_acquire_sys_global(channel_tail_idx_ptr)
+                
+                # 计算所有worker的最小head，更新全局head
+                min_head = INT_MAX
+                for i in range(1, num_recv_warps):
+                    if not warp_retired[i]:
+                        min_head = min(min_head, warp_channel_head_idx[i][lane_id])
+                
+                if min_head != INT_MAX and min_head > last_head:
+                    st_relaxed_sys_global(channel_head_idx_ptr, last_head = min_head)
+        
+        else:
+            # === Warp 1~23: 接收并归约 ===
+            
+            # 计算每个rank的缓冲区指针
+            Buffer<int4> channel_x_buffers[kNumRanks]
+            Buffer<float> channel_topk_weights_buffers[kNumRanks]
+            
+            for i in range(kNumRanks):
+                channel_rank_offset = responsible_channel * kNumRanks + i
+                ptr = buffer_ptrs[rank] + 2 * num_channels * kNumRanks * sizeof(int)
+                
+                channel_x_buffers[i] = Buffer<int4>(ptr, num_channels_total * num_recv_buffer_tokens * hidden_int4, ...)
+                ptr += num_channels_total * num_recv_buffer_tokens * sizeof(int)
+                channel_topk_weights_buffers[i] = Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_topk, ...)
+            
+            # 获取本channel负责的token范围
+            token_start_idx, token_end_idx = get_channel_task_range(num_recv_tokens, num_channels, responsible_channel)
+            
+            # 迭代处理每个token
+            for token_idx in token_start_idx + recv_warp_id - 1; token_idx < token_end_idx; token_idx += num_recv_warps - 1:
+                # Step 1: 读取send_head，等待所有rank的数据到达
+                if lane_id < kNumRanks:
+                    expected_head = ld_nc_global(send_head + token_idx * kNumRanks + lane_id)
+                
+                start_time = clock64()
+                while __any_sync(0xffffffff, channel_tail_idx[lane_id] <= expected_head and expected_head >= 0):
+                    if clock64() - start_time > NUM_TIMEOUT_CYCLES:
+                        printf("DeepEP timeout for combine receivers, rank %d, responsible_channel = %d, expect = %d\n",
+                               rank, responsible_channel, expected_head)
+                        trap()
+                
+                __syncwarp()
+                
+                # Step 2: 收集有效的rank和slot索引
+                num_topk_ranks = 0
+                topk_ranks[kNumRanks]
+                slot_indices[kNumRanks]
+                
+                for i in range(kNumRanks):
+                    expected_head_i = __shfl_sync(0xffffffff, expected_head, i)
+                    if expected_head_i >= 0:
+                        slot_indices[num_topk_ranks] = expected_head_i % num_recv_buffer_tokens
+                        topk_ranks[num_topk_ranks++] = i
+                
+                # Step 3: TMA同步（SM90）
+                if not DISABLE_SM90_FEATURES:
+                    tma_store_wait<0>()
+                    __syncwarp()
+                
+                # Step 4: 归约数据（fp32累加）
+                constexpr kNumStages = 8
+                
+                for i in lane_id; i < hidden_int4; i += 32:
+                    # 读取bias
+                    bias_0_value_int4 = (bias_0_int4 != nullptr) ? 
+                        __ldg(bias_0_int4 + token_idx * hidden_int4 + i) : make_int4(0, 0, 0, 0)
+                    bias_1_value_int4 = (bias_1_int4 != nullptr) ? 
+                        __ldg(bias_1_int4 + token_idx * hidden_int4 + i) : make_int4(0, 0, 0, 0)
+                    
+                    # 读取所有rank的buffers
+                    int4 recv_value_int4[kNumRanks]
+                    for j in range(num_topk_ranks):
+                        recv_value_int4[j] = ld_nc_global(
+                            channel_x_buffers[topk_ranks[j]].buffer() + slot_indices[j] * hidden_int4 + i)
+                    
+                    # 转换为float并归约
+                    float values[kDtypePerInt4]
+                    bias_0_values = reinterpret_cast<dtype_t*>(&bias_0_value_int4)
+                    bias_1_values = reinterpret_cast<dtype_t*>(&bias_1_value_int4)
+                    
+                    for j in range(kDtypePerInt4):
+                        values[j] = float(bias_0_values[j]) + float(bias_1_values[j])
+                    
+                    for j in range(num_topk_ranks):
+                        recv_value_dtypes = reinterpret_cast<dtype_t*>(&recv_value_int4[j])
+                        for k in range(kDtypePerInt4):
+                            values[k] += float(recv_value_dtypes[k])
+                    
+                    # 转换回dtype_t
+                    int4 out_int4
+                    out_dtypes = reinterpret_cast<dtype_t*>(&out_int4)
+                    for j in range(kDtypePerInt4):
+                        out_dtypes[j] = dtype_t(values[j])
+                    
+                    # 写回（TMA或直接写）
+                    if not DISABLE_SM90_FEATURES:
+                        if i < hidden_int4_aligned:
+                            # TMA流水线写回
+                            tma_store_wait<kNumStages - 1>()
+                            __syncwarp()
+                            
+                            tma_stage_idx = (i / 32) % kNumStages
+                            reinterpret_cast<int4*>(tma_buffer)[tma_stage_idx * 32 + lane_id] = out_int4
+                            
+                            tma_store_fence()
+                            __syncwarp()
+                            if elect_one_sync():
+                                tma_bytes = min(32, hidden_int4 - i) * sizeof(int4)
+                                tma_store_1d(reinterpret_cast<int4*>(tma_buffer) + tma_stage_idx * 32,
+                                            recv_int4 + token_idx * hidden_int4 + i,
+                                            tma_bytes, false)
+                            __syncwarp()
+                        else:
+                            recv_int4[token_idx * hidden_int4 + i] = out_int4
+                    else:
+                        recv_int4[token_idx * hidden_int4 + i] = out_int4
+                
+                # Step 5: 归约topk_weights
+                if lane_id < num_topk:
+                    value = 0.0
+                    for i in range(num_topk_ranks):
+                        value += ld_nc_global(
+                            channel_topk_weights_buffers[topk_ranks[i]].buffer() + 
+                            slot_indices[i] * num_topk + lane_id)
+                    recv_topk_weights[token_idx * num_topk + lane_id] = value
+                
+                # Step 6: 更新本warp的head索引
+                if lane_id < kNumRanks:
+                    warp_channel_head_idx[recv_warp_id][lane_id] = 
+                        (expected_head < 0) ? -expected_head - 1 : expected_head + 1
+            
+            # Step 7: 标记本warp退出
+            __syncwarp()
+            if elect_one_sync():
+                warp_retired[recv_warp_id] = true
+
+【并行模式】
+    grid: (2 * num_channels, kNumThreads=768)
+    
+    偶数SM (发送方):
+        - 每个SM的warp轮流负责不同rank: send_rank_id = (channel + warp_id) % kNumRanks
+        - 每组warp内: 多个warp并行发送不同token
+        - 循环队列: tail索引递增
+    
+    奇数SM (接收方):
+        - Warp 0: 队列head更新器
+            - 轮询所有rank的tail索引
+            - 计算所有worker warp的最小head，更新全局head
+        - Warp 1~23: 并行接收并归约
+            - 每个warp负责若干token
+            - 对每个token: 等待所有rank数据到达，fp32归约，写回
+            - 更新本warp的head索引（通过shared memory通知Warp 0）
+    
+    优化:
+        - TMA流水线 (SM90): 8-stage流水线，隐藏TMA延迟
+        - fp32累加: 避免bf16精度损失
+        - 动态退出: worker warp完成后设置retired标志，head更新器检测到全部退出后停止
+        - 负数编码: expected_head < 0 表示token未从该rank发送，解码为 -expected_head - 1
+
+【备注】
+    - combine是dispatch的逆操作: dispatch分发token到rank，combine聚合rank的输出
+    - send_head编码: 非负值=实际head索引，负值=插值索引（该token未发送到该rank）
+    - bias_0/bias_1: 可选的两个bias项（例如residual connection）
+    - 依赖cached_notify_combine预先填充send_head的缺失值
+
+
+--------------------------------
+combine (host launcher)
+来源: csrc/kernels/intranode.cu
+--------------------------------
+
+【签名】
+    @host→device
+    combine(
+        type: cudaDataType_t,
+        recv_x: void*,
+        recv_topk_weights: float*,
+        x: void*,
+        topk_weights: float*,
+        bias_0: void*,
+        bias_1: void*,
+        src_idx: int*,
+        rank_prefix_matrix: int*,
+        channel_prefix_matrix: int*,
+        send_head: int*,
+        num_tokens: int,
+        num_recv_tokens: int,
+        hidden: int,
+        num_topk: int,
+        buffer_ptrs: void**,
+        rank: int,
+        num_ranks: int,
+        stream: cudaStream_t,
+        num_sms: int,
+        num_max_send_tokens: int,
+        num_recv_buffer_tokens: int
+    )
+
+【算法】
+    constexpr kNumThreads = 768
+    constexpr kNumTMABytesPerWarp = 4096
+    
+    # 边界检查
+    assert num_sms % 2 == 0
+    assert kNumThreads >= num_ranks * 32
+    
+    # 配置启动参数
+    cfg = SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream)
+    
+    # SM90设置共享内存
+    if not DISABLE_SM90_FEATURES:
+        kernel = combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp>
+        SET_SHARED_MEMORY_FOR_TMA(kernel)
+    
+    # 根据dtype和num_ranks分发到模板实例
+    SWITCH_TYPES(COMBINE_DTYPE_LAUNCH_CASE):
+        SWITCH_RANKS_WITH_DTYPE(dtype, COMBINE_LAUNCH_CASE):
+            LAUNCH_KERNEL(&cfg, kernel, reinterpret_cast<dtype*>(recv_x), ...)
+
+
+--------------------------------
+cached_notify_dispatch (host launcher)
+来源: csrc/kernels/intranode.cu
+--------------------------------
+
+【签名】
+    @host→device
+    cached_notify_dispatch(
+        rank_prefix_matrix: int*,
+        num_memset_int: int,
+        buffer_ptrs: void**,
+        barrier_signal_ptrs: int**,
+        rank: int,
+        num_ranks: int,
+        stream: cudaStream_t
+    )
+
+【算法】
+    cfg = SETUP_LAUNCH_CONFIG(1, 128, stream)
+    SWITCH_RANKS(CACHED_NOTIFY_DISPATCH_LAUNCH_CASE):
+        LAUNCH_KERNEL(&cfg, cached_notify_dispatch<ranks>, ...)
+
+
+--------------------------------
+cached_notify_combine (host launcher)
+来源: csrc/kernels/intranode.cu
+--------------------------------
+
+【签名】
+    @host→device
+    cached_notify_combine(
+        buffer_ptrs: void**,
+        send_head: int*,
+        num_channels: int,
+        num_recv_tokens: int,
+        num_memset_int: int,
+        barrier_signal_ptrs: int**,
+        rank: int,
+        num_ranks: int,
+        stream: cudaStream_t
+    )
+
+【算法】
+    num_threads = max(128, 32 * num_ranks)
+    
+    assert num_ranks <= num_threads
+    assert num_threads <= 1024
+    assert 1 + num_channels <= num_channels * 2
+    
+    cfg = SETUP_LAUNCH_CONFIG(1 + num_channels, num_threads, stream)
+    SWITCH_RANKS(CACHED_NOTIFY_COMBINE):
+        LAUNCH_KERNEL(&cfg, cached_notify_combine<ranks>, ...)

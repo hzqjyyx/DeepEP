@@ -1,0 +1,1184 @@
+--------------------------------
+Buffer::Buffer (构造函数)
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    Buffer(
+        rank: int,
+        num_ranks: int,
+        num_nvl_bytes: int64,
+        num_rdma_bytes: int64,
+        low_latency_mode: bool,
+        explicitly_destroy: bool,
+        enable_shrink: bool,
+        use_fabric: bool
+    )
+
+【算法】
+    # 初始化基本信息
+    this.rank = rank
+    this.num_ranks = num_ranks
+    this.num_nvl_bytes = num_nvl_bytes
+    this.num_rdma_bytes = num_rdma_bytes
+    this.low_latency_mode = low_latency_mode
+    this.explicitly_destroy = explicitly_destroy
+    this.enable_shrink = enable_shrink
+    
+    # 获取设备信息
+    this.device_id = at::cuda::current_device()
+    cudaDeviceGetAttribute(&this.num_device_sms, cudaDevAttrMultiProcessorCount, this.device_id)
+    
+    # 初始化共享内存分配器
+    this.shared_memory_allocator = SharedMemoryAllocator(use_fabric)
+    
+    # 创建通信流
+    this.comm_stream = at::cuda::getStreamFromPool(true, this.device_id)
+    
+    # 分配 NVLink buffer (用于 intranode 通信)
+    if num_nvl_bytes > 0:
+        for i in range(NUM_MAX_NVL_PEERS):
+            shared_memory_allocator.malloc(&buffer_ptrs[i], num_nvl_bytes)
+        
+        cudaMalloc(&buffer_ptrs_gpu, NUM_MAX_NVL_PEERS * sizeof(void*))
+        cudaMemcpy(buffer_ptrs_gpu, buffer_ptrs, ...)
+    
+    # 分配 RDMA buffer (用于 internode 通信)
+    if num_rdma_bytes > 0:
+        nvshmem_malloc(&rdma_buffer_ptr, num_rdma_bytes)
+    
+    # 分配 shrink mode 相关 buffer
+    if enable_shrink:
+        cudaMallocHost(&mask_buffer_ptr, NUM_MAX_NVL_PEERS * sizeof(int))
+        cudaMallocHost(&sync_buffer_ptr, NUM_MAX_NVL_PEERS * sizeof(int))
+        memset(mask_buffer_ptr, 0, ...)
+        memset(sync_buffer_ptr, 0, ...)
+    
+    # 分配 barrier 信号 buffer (用于同步)
+    for i in range(NUM_MAX_NVL_PEERS):
+        shared_memory_allocator.malloc(&barrier_signal_ptrs[i], sizeof(int))
+        cudaMemset(barrier_signal_ptrs[i], 0, sizeof(int))
+    
+    cudaMalloc(&barrier_signal_ptrs_gpu, NUM_MAX_NVL_PEERS * sizeof(int*))
+    cudaMemcpy(barrier_signal_ptrs_gpu, barrier_signal_ptrs, ...)
+    
+    # 分配 workspace (临时工作空间)
+    cudaMalloc(&workspace, RUNTIME_WORKSPACE_SIZE)
+    
+    # 分配 MoE 接收计数器 (host-side, pinned memory)
+    cudaMallocHost(&moe_recv_counter, NUM_MAX_NVL_PEERS * sizeof(int))
+    cudaHostGetDevicePointer(&moe_recv_counter_mapped, moe_recv_counter, 0)
+    memset(moe_recv_counter, 0, ...)
+    
+    # 分配 expert-level MoE 接收计数器
+    cudaMallocHost(&moe_recv_expert_counter, NUM_MAX_NVL_PEERS * NUM_MAX_EXPERTS * sizeof(int))
+    cudaHostGetDevicePointer(&moe_recv_expert_counter_mapped, moe_recv_expert_counter, 0)
+    memset(moe_recv_expert_counter, 0, ...)
+    
+    # 分配 RDMA-level MoE 接收计数器
+    cudaMallocHost(&moe_recv_rdma_counter, NUM_MAX_RDMA_RANKS * sizeof(int))
+    cudaHostGetDevicePointer(&moe_recv_rdma_counter_mapped, moe_recv_rdma_counter, 0)
+    memset(moe_recv_rdma_counter, 0, ...)
+
+【备注】
+    - 构造函数分配所有通信所需的 buffer，但此时 buffer 尚未可用 (available=false)
+    - 需要调用 sync() 完成 IPC handle 交换和 NVSHMEM 初始化后才可用
+    - NUM_MAX_NVL_PEERS=8, NUM_MAX_EXPERTS, NUM_MAX_RDMA_RANKS 等常量在 kernels/configs.cuh 中定义
+
+--------------------------------
+Buffer::~Buffer (析构函数)
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【算法】
+    if not explicitly_destroy:
+        destroy()
+    
+    # 释放 NVLink buffers
+    if buffer_ptrs_gpu != nullptr:
+        cudaFree(buffer_ptrs_gpu)
+        for i in range(NUM_MAX_NVL_PEERS):
+            if buffer_ptrs[i] != nullptr:
+                shared_memory_allocator.free(buffer_ptrs[i])
+    
+    # 释放 RDMA buffer
+    if rdma_buffer_ptr != nullptr:
+        nvshmem_free(rdma_buffer_ptr)
+    
+    # 释放 shrink mode buffers
+    if mask_buffer_ptr != nullptr:
+        cudaFreeHost(mask_buffer_ptr)
+    if sync_buffer_ptr != nullptr:
+        cudaFreeHost(sync_buffer_ptr)
+    
+    # 释放 barrier signals
+    if barrier_signal_ptrs_gpu != nullptr:
+        cudaFree(barrier_signal_ptrs_gpu)
+        for i in range(NUM_MAX_NVL_PEERS):
+            if barrier_signal_ptrs[i] != nullptr:
+                shared_memory_allocator.free(barrier_signal_ptrs[i])
+    
+    # 释放 workspace
+    if workspace != nullptr:
+        cudaFree(workspace)
+    
+    # 释放 MoE 计数器
+    if moe_recv_counter != nullptr:
+        cudaFreeHost(moe_recv_counter)
+    if moe_recv_expert_counter != nullptr:
+        cudaFreeHost(moe_recv_expert_counter)
+    if moe_recv_rdma_counter != nullptr:
+        cudaFreeHost(moe_recv_rdma_counter)
+
+--------------------------------
+Buffer::is_available
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    is_available() -> bool
+
+【算法】
+    return this.available
+
+--------------------------------
+Buffer::is_internode_available
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    is_internode_available() -> bool
+
+【算法】
+    return this.num_rdma_ranks > 1
+
+--------------------------------
+Buffer::get_num_rdma_ranks
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    get_num_rdma_ranks() -> int
+
+【算法】
+    return this.num_rdma_ranks
+
+--------------------------------
+Buffer::get_rdma_rank
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    get_rdma_rank() -> int
+
+【算法】
+    return this.rdma_rank
+
+--------------------------------
+Buffer::get_root_rdma_rank
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    get_root_rdma_rank(global: bool) -> int
+
+【算法】
+    if global:
+        return rdma_rank_to_rank(0)
+    else:
+        return 0
+
+【依赖】
+    rdma_rank_to_rank    # 将 rdma_rank 映射到全局 rank
+
+--------------------------------
+Buffer::get_local_device_id
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    get_local_device_id() -> int
+
+【算法】
+    return this.device_id
+
+--------------------------------
+Buffer::get_local_ipc_handle
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    get_local_ipc_handle() -> bytearray
+
+【算法】
+    assert this.num_nvl_bytes > 0
+    
+    shared_memory_allocator.get_mem_handle(&ipc_handles[rank], buffer_ptrs[rank])
+    
+    return bytearray((char*)&ipc_handles[rank], HANDLE_SIZE)
+
+【备注】
+    - 返回当前 rank 的 IPC memory handle，用于与其他 rank 共享
+    - 使用 CUDA IPC 或 Fabric API (取决于 use_fabric)
+
+--------------------------------
+Buffer::get_local_nvshmem_unique_id
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    get_local_nvshmem_unique_id() -> bytearray
+
+【算法】
+    assert this.num_rdma_bytes > 0
+    
+    unique_id = nvshmemx_uniqueid_create()
+    
+    return bytearray((char*)&unique_id, sizeof(nvshmemx_uniqueid_t))
+
+【备注】
+    - 只在 root RDMA rank 上调用
+    - 返回 NVSHMEM unique ID 用于初始化 NVSHMEM 集合
+
+--------------------------------
+Buffer::get_local_buffer_tensor
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    get_local_buffer_tensor(
+        dtype: torch.dtype,
+        offset: int64,
+        use_rdma_buffer: bool
+    ) -> Tensor
+
+【算法】
+    if use_rdma_buffer:
+        assert this.num_rdma_bytes > 0
+        ptr = (char*)rdma_buffer_ptr + offset
+        size = num_rdma_bytes - offset
+    else:
+        assert this.num_nvl_bytes > 0
+        ptr = (char*)buffer_ptrs[rank] + offset
+        size = num_nvl_bytes - offset
+    
+    element_size = torch.elementSize(dtype)
+    assert size % element_size == 0
+    
+    return torch::from_blob(
+        ptr,
+        {size / element_size},
+        torch::TensorOptions().dtype(dtype).device(torch::kCUDA, device_id)
+    )
+
+【备注】
+    - 将 buffer 的一部分包装成 Tensor，zero-copy
+    - 用于高级用户直接访问通信 buffer
+
+--------------------------------
+Buffer::get_comm_stream
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    get_comm_stream() -> torch.Stream
+
+【算法】
+    stream_id = comm_stream.id()
+    stream_device = comm_stream.device_index()
+    
+    return py::cast(c10::cuda::CUDAStream::unpack3(
+        stream_id,
+        stream_device,
+        c10::DeviceType::CUDA
+    ))
+
+【备注】
+    - 返回 Python 侧的 torch.cuda.Stream 对象
+
+--------------------------------
+Buffer::sync
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    sync(
+        device_ids: List[int],
+        all_gathered_handles: List[Optional[bytearray]],
+        root_unique_id_opt: Optional[bytearray]
+    )
+
+【算法】
+    assert not available and not destroyed
+    
+    # 交换 NVLink IPC handles
+    if num_nvl_bytes > 0:
+        for i in range(num_ranks):
+            if i == rank:
+                continue
+            
+            if all_gathered_handles[i] is not None:
+                memcpy(&ipc_handles[i], all_gathered_handles[i].data(), HANDLE_SIZE)
+                shared_memory_allocator.open_mem_handle(&buffer_ptrs[i], &ipc_handles[i])
+        
+        cudaMemcpy(buffer_ptrs_gpu, buffer_ptrs, ...)
+    
+    # 初始化 NVSHMEM
+    if num_rdma_bytes > 0:
+        assert root_unique_id_opt is not None
+        
+        memcpy(&root_unique_id, root_unique_id_opt.data(), sizeof(nvshmemx_uniqueid_t))
+        
+        nvshmem_init(
+            rank, num_ranks,
+            buffer_ptrs_gpu,
+            barrier_signal_ptrs_gpu,
+            workspace,
+            &root_unique_id,
+            &rdma_rank,
+            &num_rdma_ranks,
+            &nvl_rank,
+            &num_nvl_ranks
+        )
+    else:
+        rdma_rank = -1
+        num_rdma_ranks = 0
+        nvl_rank = rank
+        num_nvl_ranks = num_ranks
+    
+    this.available = true
+
+【依赖】
+    nvshmem_init    # kernels/runtime.cu 中定义
+
+【备注】
+    - 必须在所有 rank 上同时调用
+    - all_gathered_handles: 每个 rank 的 IPC handle (通过 torch.distributed 收集)
+    - root_unique_id_opt: NVSHMEM unique ID (只在有 RDMA 时提供)
+    - 完成后 buffer 可用 (available=true)
+
+--------------------------------
+Buffer::destroy
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    destroy()
+
+【算法】
+    if destroyed:
+        return
+    
+    this.destroyed = true
+    
+    if not available:
+        return
+    
+    # 关闭其他 rank 的 IPC handles
+    if num_nvl_bytes > 0:
+        for i in range(num_ranks):
+            if i != rank and buffer_ptrs[i] != nullptr:
+                shared_memory_allocator.close_mem_handle(buffer_ptrs[i])
+    
+    # 销毁 NVSHMEM
+    if num_rdma_bytes > 0:
+        nvshmem_finalize()
+
+【依赖】
+    nvshmem_finalize    # kernels/runtime.cu 中定义
+
+【备注】
+    - 只在 explicitly_destroy=true 时由用户手动调用
+    - 否则由析构函数自动调用
+
+--------------------------------
+Buffer::get_dispatch_layout
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    @host→device
+    get_dispatch_layout(
+        topk_idx: Tensor[num_tokens, topk, int],
+        num_experts: int,
+        previous_event: Optional[EventHandle],
+        async: bool,
+        allocate_on_comm_stream: bool
+    ) -> (
+        is_token_in_rank: Tensor[num_tokens, topk, bool],
+        num_tokens_per_rank: Optional[Tensor[num_ranks, int]],
+        num_tokens_per_expert: Tensor[num_experts, int],
+        is_expert_in_rank: Tensor[num_experts, bool],
+        event: Optional[EventHandle]
+    )
+
+【算法】
+    assert available and not destroyed
+    
+    stream = comm_stream if allocate_on_comm_stream else at::cuda::getCurrentCUDAStream()
+    
+    if previous_event is not None:
+        cudaStreamWaitEvent(stream, previous_event)
+    
+    # 创建输出 tensors
+    is_token_in_rank = torch::empty({num_tokens, topk}, torch::kBool, device)
+    num_tokens_per_rank = torch::empty({num_ranks}, torch::kInt32, device) if not low_latency_mode else None
+    num_tokens_per_expert = torch::empty({num_experts}, torch::kInt32, device)
+    is_expert_in_rank = torch::empty({num_experts}, torch::kBool, device)
+    
+    # 调用 layout kernel
+    get_dispatch_layout_kernel(
+        is_token_in_rank,
+        num_tokens_per_rank,
+        num_tokens_per_expert,
+        is_expert_in_rank,
+        topk_idx,
+        num_experts,
+        rank,
+        num_ranks,
+        stream
+    )
+    
+    event = create_event() if async else None
+    
+    return (is_token_in_rank, num_tokens_per_rank, num_tokens_per_expert, is_expert_in_rank, event)
+
+【依赖】
+    get_dispatch_layout_kernel    # kernels/layout.cu
+
+【备注】
+    - 计算 token 到 expert/rank 的分配关系
+    - low_latency_mode 下不需要 num_tokens_per_rank
+
+--------------------------------
+Buffer::intranode_dispatch
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    @host→device
+    intranode_dispatch(
+        x: Tensor[num_tokens, hidden],
+        x_scales: Optional[Tensor[num_tokens, 1]],
+        topk_idx: Optional[Tensor[num_tokens, topk, int]],
+        topk_weights: Optional[Tensor[num_tokens, topk]],
+        num_tokens_per_rank: Optional[Tensor[num_ranks, int]],
+        is_token_in_rank: Tensor[num_tokens, topk, bool],
+        num_tokens_per_expert: Optional[Tensor[num_experts, int]],
+        cached_num_recv_tokens: int,
+        cached_rank_prefix_matrix: Optional[Tensor],
+        cached_channel_prefix_matrix: Optional[Tensor],
+        expert_alignment: int,
+        num_worst_tokens: int,
+        config: Config,
+        previous_event: Optional[EventHandle],
+        async: bool,
+        allocate_on_comm_stream: bool
+    ) -> (
+        recv_x: Tensor[num_recv_tokens, hidden],
+        recv_x_scales: Optional[Tensor[num_recv_tokens, 1]],
+        recv_topk_weights: Optional[Tensor[num_recv_tokens]],
+        recv_idx: Optional[Tensor[num_recv_tokens, int]],
+        num_recv_tokens_per_expert: List[int],
+        rank_prefix_matrix: Tensor,
+        channel_prefix_matrix: Tensor,
+        src_idx: Tensor,
+        send_head: Tensor,
+        send_tail: Tensor,
+        event: Optional[EventHandle]
+    )
+
+【算法】
+    assert available and not destroyed
+    assert num_nvl_ranks > 1
+    
+    stream = comm_stream if allocate_on_comm_stream else at::cuda::getCurrentCUDAStream()
+    
+    if previous_event is not None:
+        cudaStreamWaitEvent(stream, previous_event)
+    
+    # Step 1: 准备 config
+    dispatch_config = prepare_intranode_dispatch_config(x, config)
+    
+    # Step 2: 分配输出 buffer
+    if cached_num_recv_tokens > 0:
+        num_recv_tokens = cached_num_recv_tokens
+        rank_prefix_matrix = cached_rank_prefix_matrix
+        channel_prefix_matrix = cached_channel_prefix_matrix
+    else:
+        (num_recv_tokens, rank_prefix_matrix, channel_prefix_matrix) = 
+            allocate_intranode_dispatch_buffers(
+                num_tokens_per_rank,
+                num_experts,
+                expert_alignment,
+                num_worst_tokens,
+                stream
+            )
+    
+    recv_x = torch::empty({num_recv_tokens, hidden}, x.dtype, device)
+    recv_x_scales = torch::empty({num_recv_tokens, 1}, torch::kFloat32, device) if x_scales else None
+    recv_topk_weights = torch::empty({num_recv_tokens}, topk_weights.dtype, device) if topk_weights else None
+    recv_idx = torch::empty({num_recv_tokens}, topk_idx.dtype, device) if topk_idx else None
+    
+    src_idx = torch::empty({num_recv_tokens}, torch::kInt32, device)
+    send_head = torch::empty({num_nvl_ranks, NUM_MAX_CHANNELS_PER_PEER}, torch::kInt32, device)
+    send_tail = torch::empty({num_nvl_ranks, NUM_MAX_CHANNELS_PER_PEER}, torch::kInt32, device)
+    
+    # Step 3: 调用 dispatch kernel
+    intranode_dispatch_kernel(
+        recv_x, recv_x_scales, recv_topk_weights, recv_idx,
+        src_idx, send_head, send_tail,
+        x, x_scales, topk_idx, topk_weights,
+        is_token_in_rank,
+        rank_prefix_matrix, channel_prefix_matrix,
+        num_experts,
+        buffer_ptrs_gpu,
+        barrier_signal_ptrs_gpu,
+        moe_recv_counter_mapped,
+        dispatch_config,
+        stream
+    )
+    
+    # Step 4: 获取每个 expert 收到的 token 数
+    num_recv_tokens_per_expert = []
+    if num_tokens_per_expert is not None:
+        num_recv_tokens_per_expert = compute_num_recv_tokens_per_expert(
+            num_tokens_per_expert,
+            stream
+        )
+    
+    event = create_event() if async else None
+    
+    return (recv_x, recv_x_scales, recv_topk_weights, recv_idx,
+            num_recv_tokens_per_expert,
+            rank_prefix_matrix, channel_prefix_matrix,
+            src_idx, send_head, send_tail,
+            event)
+
+【依赖】
+    intranode_dispatch_kernel    # kernels/intranode.cu
+
+【备注】
+    - NVLink-based all-to-all dispatch
+    - buffer_ptrs_gpu: 指向所有 rank 的 NVLink buffer 指针数组
+    - moe_recv_counter_mapped: host-side 计数器，GPU 写入接收的 token 数
+    - cached_* 参数用于 CUDA Graph 模式
+
+--------------------------------
+Buffer::intranode_combine
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    @host→device
+    intranode_combine(
+        x: Tensor[num_tokens, hidden],
+        topk_weights: Optional[Tensor[num_tokens]],
+        bias_0: Optional[Tensor[hidden]],
+        bias_1: Optional[Tensor[hidden]],
+        src_idx: Tensor[num_tokens, int],
+        rank_prefix_matrix: Tensor,
+        channel_prefix_matrix: Tensor,
+        send_head: Tensor,
+        config: Config,
+        previous_event: Optional[EventHandle],
+        async: bool,
+        allocate_on_comm_stream: bool
+    ) -> (
+        recv_x: Tensor[orig_num_tokens, hidden],
+        recv_x_scales: Optional[Tensor[orig_num_tokens, 1]],
+        event: Optional[EventHandle]
+    )
+
+【算法】
+    assert available and not destroyed
+    assert num_nvl_ranks > 1
+    
+    stream = comm_stream if allocate_on_comm_stream else at::cuda::getCurrentCUDAStream()
+    
+    if previous_event is not None:
+        cudaStreamWaitEvent(stream, previous_event)
+    
+    # Step 1: 准备 config
+    combine_config = prepare_intranode_combine_config(x, config)
+    
+    # Step 2: 计算原始 token 数 (combine 前的 token 数)
+    orig_num_tokens = compute_orig_num_tokens(rank_prefix_matrix, stream)
+    
+    # Step 3: 分配输出 buffer
+    recv_x = torch::empty({orig_num_tokens, hidden}, x.dtype, device)
+    recv_x_scales = torch::empty({orig_num_tokens, 1}, torch::kFloat32, device) if has_fp8(x) else None
+    
+    # Step 4: 调用 combine kernel
+    intranode_combine_kernel(
+        recv_x, recv_x_scales,
+        x, topk_weights,
+        bias_0, bias_1,
+        src_idx,
+        rank_prefix_matrix, channel_prefix_matrix,
+        send_head,
+        buffer_ptrs_gpu,
+        barrier_signal_ptrs_gpu,
+        combine_config,
+        stream
+    )
+    
+    event = create_event() if async else None
+    
+    return (recv_x, recv_x_scales, event)
+
+【依赖】
+    intranode_combine_kernel    # kernels/intranode.cu
+
+【备注】
+    - NVLink-based all-to-all combine
+    - 将分散在各 rank 上的 expert 输出聚合回原始 token 顺序
+
+--------------------------------
+Buffer::internode_dispatch
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    @host→device
+    internode_dispatch(
+        x: Tensor[num_tokens, hidden],
+        x_scales: Optional[Tensor[num_tokens, 1]],
+        topk_idx: Optional[Tensor[num_tokens, topk, int]],
+        topk_weights: Optional[Tensor[num_tokens, topk]],
+        num_tokens_per_rank: Optional[Tensor[num_ranks, int]],
+        num_tokens_per_rdma_rank: Optional[Tensor[num_rdma_ranks, int]],
+        is_token_in_rank: Tensor[num_tokens, topk, bool],
+        num_tokens_per_expert: Optional[Tensor[num_experts, int]],
+        cached_num_recv_tokens: int,
+        cached_num_rdma_recv_tokens: int,
+        cached_rdma_channel_prefix_matrix: Optional[Tensor],
+        cached_recv_rdma_rank_prefix_sum: Optional[Tensor],
+        cached_gbl_channel_prefix_matrix: Optional[Tensor],
+        cached_recv_gbl_rank_prefix_sum: Optional[Tensor],
+        expert_alignment: int,
+        num_worst_tokens: int,
+        config: Config,
+        previous_event: Optional[EventHandle],
+        async: bool,
+        allocate_on_comm_stream: bool
+    ) -> (
+        recv_x: Tensor[num_recv_tokens, hidden],
+        recv_x_scales: Optional[Tensor[num_recv_tokens, 1]],
+        recv_topk_weights: Optional[Tensor[num_recv_tokens]],
+        recv_idx: Optional[Tensor[num_recv_tokens, int]],
+        num_recv_tokens_per_expert: List[int],
+        rdma_channel_prefix_matrix: Tensor,
+        rdma_rank_prefix_sum: Tensor,
+        recv_rdma_rank_prefix_sum: Optional[Tensor],
+        gbl_channel_prefix_matrix: Tensor,
+        recv_gbl_rank_prefix_sum: Optional[Tensor],
+        src_meta: Tensor,
+        combined_rdma_head: Optional[Tensor],
+        combined_nvl_head: Optional[Tensor],
+        is_combined_token_in_rank: Optional[Tensor],
+        event: Optional[EventHandle]
+    )
+
+【算法】
+    assert available and not destroyed
+    assert num_rdma_ranks > 1
+    
+    stream = comm_stream if allocate_on_comm_stream else at::cuda::getCurrentCUDAStream()
+    
+    if previous_event is not None:
+        cudaStreamWaitEvent(stream, previous_event)
+    
+    # Step 1: 准备 config
+    dispatch_config = prepare_internode_dispatch_config(x, config)
+    
+    # Step 2: 分配输出 buffer (根据是否有 cached 值)
+    if cached_num_recv_tokens > 0:
+        num_recv_tokens = cached_num_recv_tokens
+        num_rdma_recv_tokens = cached_num_rdma_recv_tokens
+        rdma_channel_prefix_matrix = cached_rdma_channel_prefix_matrix
+        recv_rdma_rank_prefix_sum = cached_recv_rdma_rank_prefix_sum
+        gbl_channel_prefix_matrix = cached_gbl_channel_prefix_matrix
+        recv_gbl_rank_prefix_sum = cached_recv_gbl_rank_prefix_sum
+    else:
+        (num_recv_tokens, num_rdma_recv_tokens,
+         rdma_channel_prefix_matrix, rdma_rank_prefix_sum,
+         recv_rdma_rank_prefix_sum,
+         gbl_channel_prefix_matrix,
+         recv_gbl_rank_prefix_sum) = 
+            allocate_internode_dispatch_buffers(
+                num_tokens_per_rank,
+                num_tokens_per_rdma_rank,
+                num_experts,
+                expert_alignment,
+                num_worst_tokens,
+                stream
+            )
+    
+    recv_x = torch::empty({num_recv_tokens, hidden}, x.dtype, device)
+    recv_x_scales = torch::empty({num_recv_tokens, 1}, torch::kFloat32, device) if x_scales else None
+    recv_topk_weights = torch::empty({num_recv_tokens}, topk_weights.dtype, device) if topk_weights else None
+    recv_idx = torch::empty({num_recv_tokens}, topk_idx.dtype, device) if topk_idx else None
+    
+    src_meta = torch::empty({num_recv_tokens, 2}, torch::kInt32, device)
+    combined_rdma_head = torch::empty({...}, torch::kInt32, device) if num_rdma_ranks > 1 else None
+    combined_nvl_head = torch::empty({...}, torch::kInt32, device) if num_nvl_ranks > 1 else None
+    is_combined_token_in_rank = torch::empty({...}, torch::kBool, device) if needed else None
+    
+    # Step 3: 调用 dispatch kernel
+    internode_dispatch_kernel(
+        recv_x, recv_x_scales, recv_topk_weights, recv_idx,
+        src_meta, combined_rdma_head, combined_nvl_head,
+        is_combined_token_in_rank,
+        x, x_scales, topk_idx, topk_weights,
+        is_token_in_rank,
+        rdma_channel_prefix_matrix, rdma_rank_prefix_sum,
+        gbl_channel_prefix_matrix,
+        num_experts,
+        rdma_buffer_ptr,
+        buffer_ptrs_gpu,
+        barrier_signal_ptrs_gpu,
+        moe_recv_counter_mapped,
+        moe_recv_rdma_counter_mapped,
+        dispatch_config,
+        stream
+    )
+    
+    # Step 4: 获取每个 expert 收到的 token 数
+    num_recv_tokens_per_expert = []
+    if num_tokens_per_expert is not None:
+        num_recv_tokens_per_expert = compute_num_recv_tokens_per_expert(
+            num_tokens_per_expert,
+            stream
+        )
+    
+    event = create_event() if async else None
+    
+    return (recv_x, recv_x_scales, recv_topk_weights, recv_idx,
+            num_recv_tokens_per_expert,
+            rdma_channel_prefix_matrix, rdma_rank_prefix_sum,
+            recv_rdma_rank_prefix_sum,
+            gbl_channel_prefix_matrix,
+            recv_gbl_rank_prefix_sum,
+            src_meta,
+            combined_rdma_head, combined_nvl_head,
+            is_combined_token_in_rank,
+            event)
+
+【依赖】
+    internode_dispatch_kernel    # kernels/internode.cu
+
+【备注】
+    - RDMA + NVLink 混合的 all-to-all dispatch
+    - rdma_buffer_ptr: NVSHMEM 分配的 RDMA buffer
+    - 支持跨节点通信
+
+--------------------------------
+Buffer::internode_combine
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    @host→device
+    internode_combine(
+        x: Tensor[num_tokens, hidden],
+        topk_weights: Optional[Tensor[num_tokens]],
+        bias_0: Optional[Tensor[hidden]],
+        bias_1: Optional[Tensor[hidden]],
+        src_meta: Tensor[num_tokens, 2, int],
+        is_combined_token_in_rank: Tensor[orig_num_tokens, topk, bool],
+        rdma_channel_prefix_matrix: Tensor,
+        rdma_rank_prefix_sum: Tensor,
+        gbl_channel_prefix_matrix: Tensor,
+        combined_rdma_head: Tensor,
+        combined_nvl_head: Tensor,
+        config: Config,
+        previous_event: Optional[EventHandle],
+        async: bool,
+        allocate_on_comm_stream: bool
+    ) -> (
+        recv_x: Tensor[orig_num_tokens, hidden],
+        recv_x_scales: Optional[Tensor[orig_num_tokens, 1]],
+        event: Optional[EventHandle]
+    )
+
+【算法】
+    assert available and not destroyed
+    assert num_rdma_ranks > 1
+    
+    stream = comm_stream if allocate_on_comm_stream else at::cuda::getCurrentCUDAStream()
+    
+    if previous_event is not None:
+        cudaStreamWaitEvent(stream, previous_event)
+    
+    # Step 1: 准备 config
+    combine_config = prepare_internode_combine_config(x, config)
+    
+    # Step 2: 计算原始 token 数
+    orig_num_tokens = compute_orig_num_tokens(is_combined_token_in_rank, stream)
+    
+    # Step 3: 分配输出 buffer
+    recv_x = torch::empty({orig_num_tokens, hidden}, x.dtype, device)
+    recv_x_scales = torch::empty({orig_num_tokens, 1}, torch::kFloat32, device) if has_fp8(x) else None
+    
+    # Step 4: 调用 combine kernel
+    internode_combine_kernel(
+        recv_x, recv_x_scales,
+        x, topk_weights,
+        bias_0, bias_1,
+        src_meta,
+        is_combined_token_in_rank,
+        rdma_channel_prefix_matrix, rdma_rank_prefix_sum,
+        gbl_channel_prefix_matrix,
+        combined_rdma_head, combined_nvl_head,
+        rdma_buffer_ptr,
+        buffer_ptrs_gpu,
+        barrier_signal_ptrs_gpu,
+        combine_config,
+        stream
+    )
+    
+    event = create_event() if async else None
+    
+    return (recv_x, recv_x_scales, event)
+
+【依赖】
+    internode_combine_kernel    # kernels/internode.cu
+
+【备注】
+    - RDMA + NVLink 混合的 all-to-all combine
+
+--------------------------------
+Buffer::clean_low_latency_buffer
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    clean_low_latency_buffer(
+        num_max_dispatch_tokens_per_rank: int,
+        hidden: int,
+        num_experts: int
+    )
+
+【算法】
+    assert available and not destroyed
+    assert low_latency_mode
+    
+    stream = comm_stream
+    
+    buffer_size = compute_low_latency_buffer_size(
+        num_max_dispatch_tokens_per_rank,
+        hidden,
+        num_experts
+    )
+    
+    # 清空两个 buffer (double buffering)
+    for i in [0, 1]:
+        cudaMemsetAsync(
+            get_low_latency_buffer(i),
+            0,
+            buffer_size,
+            stream
+        )
+    
+    cudaStreamSynchronize(stream)
+
+【备注】
+    - Low-latency mode 使用 double buffering
+    - 在推理开始前需要清空 buffer
+
+--------------------------------
+Buffer::low_latency_dispatch
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    @host→device
+    low_latency_dispatch(
+        x: Tensor[num_tokens, hidden],
+        topk_idx: Tensor[num_tokens, topk, int],
+        cumulative_local_expert_recv_stats: Optional[Tensor],
+        dispatch_wait_recv_cost_stats: Optional[Tensor],
+        num_max_dispatch_tokens_per_rank: int,
+        num_experts: int,
+        use_fp8: bool,
+        round_scale: bool,
+        use_ue8m0: bool,
+        async: bool,
+        return_recv_hook: bool
+    ) -> (
+        recv_x: Tensor[num_max_recv_tokens, hidden],
+        recv_x_scales: Optional[Tensor[num_max_recv_tokens, 1]],
+        num_tokens_per_expert: Tensor[num_experts, int],
+        recv_tail: Tensor[num_rdma_ranks, num_local_experts, int],
+        layout_range: Tensor[num_experts, 2, int],
+        event: Optional[EventHandle],
+        recv_hook: Optional[Callable]
+    )
+
+【算法】
+    assert available and not destroyed
+    assert low_latency_mode
+    
+    stream = comm_stream
+    
+    # Step 1: 切换 buffer (double buffering)
+    current_buffer_idx = low_latency_buffer_idx
+    low_latency_buffer_idx = 1 - low_latency_buffer_idx
+    
+    recv_buffer_ptr = get_low_latency_buffer(current_buffer_idx)
+    send_buffer_ptr = get_low_latency_buffer(1 - current_buffer_idx)
+    
+    # Step 2: 分配输出 tensors
+    num_max_recv_tokens = num_max_dispatch_tokens_per_rank * num_rdma_ranks
+    
+    recv_x = wrap_buffer_as_tensor(recv_buffer_ptr, num_max_recv_tokens, hidden, x.dtype)
+    recv_x_scales = allocate_scales(num_max_recv_tokens) if use_fp8 else None
+    num_tokens_per_expert = torch::empty({num_experts}, torch::kInt32, device)
+    recv_tail = torch::empty({num_rdma_ranks, num_local_experts}, torch::kInt32, device)
+    layout_range = torch::empty({num_experts, 2}, torch::kInt32, device)
+    
+    # Step 3: 调用 low-latency dispatch kernel
+    low_latency_dispatch_kernel(
+        recv_x, recv_x_scales,
+        num_tokens_per_expert,
+        recv_tail,
+        layout_range,
+        x, topk_idx,
+        send_buffer_ptr,
+        recv_buffer_ptr,
+        num_max_dispatch_tokens_per_rank,
+        num_experts,
+        use_fp8, round_scale, use_ue8m0,
+        cumulative_local_expert_recv_stats,
+        dispatch_wait_recv_cost_stats,
+        stream
+    )
+    
+    # Step 4: 创建 recv hook (可选)
+    recv_hook = None
+    if return_recv_hook:
+        recv_hook = create_recv_hook(recv_tail, stream)
+    
+    event = create_event() if async else None
+    
+    return (recv_x, recv_x_scales, num_tokens_per_expert, recv_tail, layout_range, event, recv_hook)
+
+【依赖】
+    low_latency_dispatch_kernel    # kernels/internode_ll.cu
+
+【备注】
+    - Low-latency 推理模式，使用 double buffering 减少延迟
+    - recv_hook: Python callable，在计算前调用以等待接收完成
+    - 支持 FP8 量化 (e4m3fn, e5m2, ue8m0)
+
+--------------------------------
+Buffer::low_latency_combine
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    @host→device
+    low_latency_combine(
+        x: Tensor[num_tokens, hidden],
+        topk_idx: Tensor[orig_num_tokens, topk, int],
+        topk_weights: Tensor[orig_num_tokens, topk],
+        src_info: Tensor[num_tokens, 2, int],
+        layout_range: Tensor[num_experts, 2, int],
+        combine_wait_recv_cost_stats: Optional[Tensor],
+        num_max_dispatch_tokens_per_rank: int,
+        num_experts: int,
+        use_logfmt: bool,
+        zero_copy: bool,
+        async: bool,
+        return_recv_hook: bool,
+        out: Optional[Tensor] = None
+    ) -> (
+        recv_x: Tensor[orig_num_tokens, hidden],
+        event: Optional[EventHandle],
+        recv_hook: Optional[Callable]
+    )
+
+【算法】
+    assert available and not destroyed
+    assert low_latency_mode
+    
+    stream = comm_stream
+    
+    # Step 1: 获取当前 buffer
+    current_buffer_idx = low_latency_buffer_idx
+    recv_buffer_ptr = get_low_latency_buffer(current_buffer_idx)
+    
+    # Step 2: 分配输出 tensor
+    orig_num_tokens = topk_idx.size(0)
+    
+    if zero_copy:
+        # Zero-copy: 直接在 buffer 中写入结果
+        recv_x = wrap_buffer_as_tensor(recv_buffer_ptr, orig_num_tokens, hidden, x.dtype)
+    else:
+        # 正常模式: 分配新 tensor
+        if out is not None:
+            recv_x = out
+        else:
+            recv_x = torch::empty({orig_num_tokens, hidden}, x.dtype, device)
+    
+    # Step 3: 分配 send_tail (用于同步)
+    send_tail = torch::empty({num_rdma_ranks, num_local_experts}, torch::kInt32, device)
+    
+    # Step 4: 调用 low-latency combine kernel
+    low_latency_combine_kernel(
+        recv_x,
+        send_tail,
+        x, topk_idx, topk_weights,
+        src_info,
+        layout_range,
+        recv_buffer_ptr,
+        num_max_dispatch_tokens_per_rank,
+        num_experts,
+        use_logfmt,
+        combine_wait_recv_cost_stats,
+        stream
+    )
+    
+    # Step 5: 创建 recv hook (可选)
+    recv_hook = None
+    if return_recv_hook:
+        recv_hook = create_recv_hook(send_tail, stream)
+    
+    event = create_event() if async else None
+    
+    return (recv_x, event, recv_hook)
+
+【依赖】
+    low_latency_combine_kernel    # kernels/internode_ll.cu
+
+【备注】
+    - use_logfmt: topk_weights 是否使用 log 格式存储
+    - zero_copy: 是否直接在通信 buffer 中写入结果
+
+--------------------------------
+Buffer::get_next_low_latency_combine_buffer
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    get_next_low_latency_combine_buffer(
+        num_max_dispatch_tokens_per_rank: int,
+        hidden: int,
+        num_experts: int
+    ) -> Tensor
+
+【算法】
+    assert available and not destroyed
+    assert low_latency_mode
+    
+    next_buffer_idx = 1 - low_latency_buffer_idx
+    buffer_ptr = get_low_latency_buffer(next_buffer_idx)
+    
+    num_max_tokens = compute_max_tokens_for_combine(
+        num_max_dispatch_tokens_per_rank,
+        num_experts
+    )
+    
+    return wrap_buffer_as_tensor(buffer_ptr, num_max_tokens, hidden, torch::kBFloat16)
+
+【备注】
+    - 用于 zero-copy 模式，提前获取下一次 combine 的输出 buffer
+
+--------------------------------
+Buffer::low_latency_update_mask_buffer
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    low_latency_update_mask_buffer(rank_to_mask: int, mask: bool)
+
+【算法】
+    assert available and not destroyed
+    assert enable_shrink
+    
+    mask_buffer_ptr[rank_to_mask] = 1 if mask else 0
+
+【备注】
+    - Shrink mode: 动态屏蔽某些 rank (用于 speculative decoding)
+
+--------------------------------
+Buffer::low_latency_query_mask_buffer
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    low_latency_query_mask_buffer(mask_status: Tensor[num_ranks, int])
+
+【算法】
+    assert available and not destroyed
+    assert enable_shrink
+    
+    # 同步 sync_buffer (等待所有 rank 更新完 mask)
+    while any(sync_buffer_ptr[i] != expected_value for i in range(num_ranks)):
+        pass
+    
+    # 拷贝 mask 状态到 tensor
+    cudaMemcpy(mask_status.data_ptr(), mask_buffer_ptr, ...)
+
+【备注】
+    - 查询所有 rank 的 mask 状态
+    - 使用 sync_buffer 进行跨 rank 同步
+
+--------------------------------
+Buffer::low_latency_clean_mask_buffer
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【签名】
+    low_latency_clean_mask_buffer()
+
+【算法】
+    assert available and not destroyed
+    assert enable_shrink
+    
+    memset(mask_buffer_ptr, 0, NUM_MAX_NVL_PEERS * sizeof(int))
+    memset(sync_buffer_ptr, 0, NUM_MAX_NVL_PEERS * sizeof(int))
+
+【备注】
+    - 清空 mask 和 sync buffer
+
+--------------------------------
+SharedMemoryAllocator (共享内存分配器类)
+来源: csrc/deep_ep.cpp
+--------------------------------
+
+【状态】
+    use_fabric: bool    # 是否使用 CUDA Fabric API (SM90+)
+
+【接口】
+    SharedMemoryAllocator(use_fabric: bool)
+        用途: 构造函数，选择分配方式 (CUDA IPC 或 Fabric API)
+    
+    malloc(ptr: void**, size: size_t)
+        用途: 分配共享内存
+        调用: cudaMalloc 或 cuMemCreate + cuMemMap (Fabric API)
+    
+    free(ptr: void*)
+        用途: 释放共享内存
+        调用: cudaFree 或 cuMemUnmap + cuMemRelease
+    
+    get_mem_handle(mem_handle: MemHandle*, ptr: void*)
+        用途: 获取内存的 IPC handle
+        调用: cudaIpcGetMemHandle 或 cuMemExportToShareableHandle
+    
+    open_mem_handle(ptr: void**, mem_handle: MemHandle*)
+        用途: 打开其他进程的 IPC handle
+        调用: cudaIpcOpenMemHandle 或 cuMemImportFromShareableHandle + cuMemMap
+    
+    close_mem_handle(ptr: void*)
+        用途: 关闭 IPC handle
+        调用: cudaIpcCloseMemHandle 或 cuMemUnmap
+
+【依赖】
+    CUDA Driver API (cuMem*)    # Fabric API
+    CUDA Runtime API (cudaIpc*) # CUDA IPC
+
+【平台特定】
+    SM90+: 优先使用 Fabric API (更高效)
+    SM80:  使用 CUDA IPC

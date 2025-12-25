@@ -1,0 +1,66 @@
+--------------------------------
+EventHandle (CUDA事件封装)
+来源: csrc/event.hpp
+--------------------------------
+
+【状态】
+    event: shared_ptr<torch::Event>    # CUDA事件对象
+
+【接口】
+    EventHandle()
+        用途: 默认构造，在当前CUDA流上记录事件
+        调用: at::cuda::getCurrentCUDAStream()
+
+    EventHandle(stream: CUDAStream)
+        用途: 在指定CUDA流上记录事件
+
+    current_stream_wait()
+        用途: 让当前CUDA流等待此事件完成
+        调用: at::cuda::getCurrentCUDAStream().unwrap().wait()
+
+【依赖】
+    torch::Event          # PyTorch CUDA事件
+    at::cuda::CUDAStream  # CUDA流管理
+
+--------------------------------
+create_event
+来源: csrc/event.hpp
+--------------------------------
+
+【签名】
+    create_event(s: CUDAStream) -> torch::Event
+
+【算法】
+    event = torch::Event(torch::kCUDA)
+    event.record(s)
+    return event
+
+--------------------------------
+stream_wait (流间同步)
+来源: csrc/event.hpp
+--------------------------------
+
+【签名】
+    stream_wait(s_0: CUDAStream, s_1: CUDAStream)
+
+【算法】
+    assert s_0.id() != s_1.id()
+    event = create_event(s_1)
+    s_0.unwrap().wait(event)
+
+【备注】
+    让流s_0等待流s_1完成
+
+--------------------------------
+stream_wait (事件同步)
+来源: csrc/event.hpp
+--------------------------------
+
+【签名】
+    stream_wait(s: CUDAStream, event: EventHandle)
+
+【算法】
+    s.unwrap().wait(*event.event)
+
+【备注】
+    让流s等待event完成

@@ -1,0 +1,624 @@
+# 内存与同步工具（CUDA Device-side Utilities）
+来源: csrc/kernels/utils.cuh
+
+---
+
+## UNROLLED_WARP_COPY（宏）
+
+【签名】
+    UNROLLED_WARP_COPY(
+        UNROLL_FACTOR: int,
+        LANE_ID: int,
+        N: int,
+        DST: pointer,
+        SRC: pointer,
+        LD_FUNC: load_function,
+        ST_FUNC: store_function
+    )
+
+【算法】
+    kLoopStride = 32 * UNROLL_FACTOR
+    
+    # 主循环：处理完整的 kLoopStride 块
+    for i in range(LANE_ID, N // kLoopStride * kLoopStride, kLoopStride):
+        # 展开加载
+        for j in range(UNROLL_FACTOR):
+            unrolled_values[j] = LD_FUNC(SRC + i + j * 32)
+        # 展开存储
+        for j in range(UNROLL_FACTOR):
+            ST_FUNC(DST + i + j * 32, unrolled_values[j])
+    
+    # 尾部处理：不足一个 kLoopStride 的剩余元素
+    i = N // kLoopStride * kLoopStride + LANE_ID
+    for j in range(UNROLL_FACTOR):
+        if i + j * 32 < N:
+            unrolled_values[j] = LD_FUNC(SRC + i + j * 32)
+    for j in range(UNROLL_FACTOR):
+        if i + j * 32 < N:
+            ST_FUNC(DST + i + j * 32, unrolled_values[j])
+
+【并行模式】
+    warp-level: 32个线程并行，每个线程负责 stride=32 的元素
+
+【备注】
+    - 用于 warp 内高效复制，支持自定义加载/存储函数
+    - 循环展开因子 UNROLL_FACTOR 可调优
+
+---
+
+## VecInt（类型映射）
+
+【用途】
+    将字节数映射到对应的整型向量类型
+
+【映射】
+    1  byte  -> int8_t
+    2  bytes -> int16_t
+    4  bytes -> int
+    8  bytes -> int64_t
+    16 bytes -> int4
+
+---
+
+## PatternVisitor（函子包装器）
+
+【签名】
+    @device @host
+    PatternVisitor<FuncT>(func: FuncT)
+
+【用途】
+    将任意函数包装为支持 `[]` 索引的访问器
+
+【算法】
+    operator[](i: uint32_t) -> auto:
+        return func(i)
+
+---
+
+## 内存屏障与同步原语
+
+【函数】
+    @device
+    trap()
+        用途: 触发 GPU trap 指令，终止线程执行
+        调用: asm("trap;")
+
+    @device
+    memory_fence()
+        用途: 系统级（跨GPU）内存屏障
+        调用: asm("fence.acq_rel.sys;")
+
+    @device
+    memory_fence_gpu()
+        用途: GPU 级内存屏障
+        调用: asm("fence.acq_rel.gpu;")
+
+    @device
+    memory_fence_cta()
+        用途: CTA（线程块）级内存屏障
+        调用: asm("fence.acq_rel.cta;")
+
+---
+
+## 原子与同步内存访问（PTX 封装）
+
+### 存储操作
+
+【函数】
+    @device
+    st_relaxed_sys_global(ptr: const int*, val: int)
+        用途: 系统级 relaxed 语义存储（无同步保证）
+        调用: asm("st.relaxed.sys.global.s32 [%0], %1;")
+
+    @device
+    st_release_sys_global(ptr: const int*, val: int)
+        用途: 系统级 release 语义存储（写入对其他设备可见）
+        调用: asm("st.release.sys.global.s32 [%0], %1;")
+
+    @device
+    st_release_cta(ptr: const int*, val: int)
+        用途: CTA 级 release 语义存储
+        调用: asm("st.release.cta.s32 [%0], %1;")
+
+### 加载操作
+
+【函数】
+    @device
+    ld_acquire_sys_global(ptr: const int*) -> int
+        用途: 系统级 acquire 语义加载（保证读取最新值）
+        调用: asm("ld.acquire.sys.global.s32 %0, [%1];")
+
+    @device
+    ld_acquire_sys_global(ptr: const uint64_t*) -> uint64_t
+        用途: 系统级 acquire 语义加载（64位）
+        调用: asm("ld.acquire.sys.global.u64 %0, [%1];")
+
+    @device
+    ld_acquire_global(ptr: const int*) -> int
+        用途: GPU 级 acquire 语义加载
+        调用: asm("ld.acquire.gpu.global.s32 %0, [%1];")
+
+    @device
+    ld_acquire_cta(ptr: const int*) -> int
+        用途: CTA 级 acquire 语义加载
+        调用: asm("ld.acquire.cta.s32 %0, [%1];")
+
+### 原子操作
+
+【函数】
+    @device
+    atomic_add_release_sys_global(ptr: const int*, value: int) -> int
+        用途: 系统级 release 语义原子加
+        调用: asm("atom.add.release.sys.global.s32 %0, [%1], %2;")
+
+    @device
+    atomic_add_release_global(ptr: const int*, value: int) -> int
+        用途: GPU 级 release 语义原子加
+        调用: asm("atom.add.release.gpu.global.s32 %0, [%1], %2;")
+
+---
+
+## 无缓存（No-Allocate）加载/存储
+
+### 加载操作（ld_na_relaxed）
+
+【函数】
+    @device
+    ld_na_relaxed(ptr: const uint8_t*) -> uint8_t
+    ld_na_relaxed(ptr: const uint16_t*) -> uint16_t
+    ld_na_relaxed(ptr: const uint32_t*) -> uint32_t
+    ld_na_relaxed(ptr: const uint64_t*) -> uint64_t
+
+        用途: L1 无分配的 relaxed 加载（不污染缓存）
+        调用: asm("ld.relaxed.gpu.global.L1::no_allocate.bXX %0, [%1];")
+
+### 加载操作（ld_nc_global）
+
+【函数】
+    @device
+    template<dtype_t>
+    ld_nc_global(ptr: const dtype_t*) -> dtype_t
+
+    特化版本:
+        uint8_t, int, int64_t, float, int2, int4
+
+        用途: 全局 non-coherent 加载（SASS: LDG.E.NA.[width].CONSTANT）
+        调用: asm(LD_NC_FUNC ".dtype %0, [%1];")
+        
+        配置:
+            LD_NC_FUNC = "ld.global.nc.L1::no_allocate.L2::256B"  # 默认（激进）
+            LD_NC_FUNC = "ld.volatile.global"                      # DISABLE_AGGRESSIVE_PTX_INSTRS=1
+
+【备注】
+    - LD_NC_FUNC 默认使用 L2::256B 缓存提示（Hopper 架构优化）
+    - 若平台不支持，编译时设置 DISABLE_AGGRESSIVE_PTX_INSTRS=1
+
+### volatile 加载
+
+【函数】
+    @device
+    ld_volatile_global(ptr: const int*) -> int
+    ld_volatile_global(ptr: const float*) -> float
+    ld_volatile_global(ptr: const int64_t*) -> int64_t
+    ld_volatile_global(ptr: const uint64_t*) -> int64_t
+
+        用途: volatile 加载（保证每次从全局内存读取）
+        调用: asm("ld.volatile.global.dtype %0, [%1];")
+
+### 存储操作（st_na_relaxed）
+
+【函数】
+    @device
+    st_na_relaxed(ptr: const uint8_t*, val: uint8_t)
+    st_na_relaxed(ptr: const uint16_t*, val: uint16_t)
+    st_na_relaxed(ptr: const uint32_t*, val: uint32_t)
+    st_na_relaxed(ptr: const int*, val: int)
+    st_na_relaxed(ptr: const int4*, val: int4)
+
+        用途: L1 无分配的 relaxed 存储
+        调用: asm("st.relaxed.gpu.global.L1::no_allocate.bXX [%0], %1;")
+
+### 存储操作（st_na_release）
+
+【函数】
+    @device
+    st_na_release(ptr: const int*, val: int)
+    st_na_release(ptr: const uint32_t*, val: uint32_t)
+    st_na_release(ptr: const uint64_t*, val: uint64_t)
+
+        用途: L1 无分配的 release 存储（保证写入对其他线程可见）
+        调用: asm("st.release.gpu.global.L1::no_allocate.bXX [%0], %1;")
+
+### 存储操作（st_na_global）
+
+【函数】
+    @device
+    template<dtype_t>
+    st_na_global(ptr: const dtype_t*, value: const dtype_t&)
+
+    特化版本:
+        int, int64_t, float, int4
+
+        用途: 全局 no-allocate 存储（SASS: ST.E.NA.[width]）
+        调用: asm(ST_NA_FUNC ".dtype [%0], %1;")
+        
+        配置:
+            ST_NA_FUNC = "st.global.L1::no_allocate"  # 默认（激进）
+            ST_NA_FUNC = "st.global"                  # DISABLE_AGGRESSIVE_PTX_INSTRS=1
+
+---
+
+## 数学近似函数
+
+【函数】
+    @device
+    log2f_approx(x: float) -> float
+        用途: 近似计算 log₂(x)
+        调用: asm("lg2.approx.f32 %0, %1;")
+
+    @device
+    exp2f_approx(x: float) -> float
+        用途: 近似计算 2ˣ
+        调用: asm("ex2.approx.f32 %0, %1;")
+
+---
+
+## 线程与 Warp 工具
+
+【函数】
+    @device
+    get_lane_id() -> int
+        用途: 获取当前线程在 warp 内的 lane ID（0-31）
+        调用: asm("mov.s32 %0, %laneid;")
+
+    @device
+    elect_one_sync() -> uint32_t
+        用途: 在 warp 内选举一个代表线程（SM90+ 使用 elect.sync）
+        调用: asm("elect.sync %%rx|%%px, %1;")  # SM90
+        fallback: get_lane_id() == 0            # SM80
+
+【备注】
+    - SM90（Hopper）: 硬件支持 elect.sync 指令
+    - SM80（Ampere）: 降级为选择 lane 0
+
+---
+
+## TMA（张量内存加速器）与 MBarrier（SM90+）
+
+### 初始化与管理
+
+【函数】
+    @device
+    fence_barrier_init()
+        用途: cluster 级 mbarrier 初始化屏障
+        调用: asm("fence.mbarrier_init.release.cluster;")
+
+    @device
+    mbarrier_init(mbar_ptr: uint64_t*, arrive_count: uint32_t)
+        用途: 初始化 mbarrier，设置到达计数
+        调用: asm("mbarrier.init.shared::cta.b64 [%1], %0;")
+
+    @device
+    mbarrier_inval(mbar_ptr: uint64_t*)
+        用途: 使 mbarrier 失效
+        调用: asm("mbarrier.inval.shared::cta.b64 [%0];")
+
+### 等待与到达
+
+【函数】
+    @device
+    template<bool kWithMultiStages = false>
+    mbarrier_wait(mbar_ptr: uint64_t*, phase: uint32_t&, stage_idx: int = 0)
+        参数: kWithMultiStages=是否支持多阶段流水线, phase=当前相位, stage_idx=阶段索引
+        用途: 等待 mbarrier 达到指定相位
+        调用: asm("mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1, %2;")
+        
+        算法:
+            wait = kWithMultiStages ? (phase >> stage_idx) & 1 : phase
+            loop:
+                if mbarrier.try_wait.parity(mbar_ptr, wait):
+                    break
+            phase ^= kWithMultiStages ? (1 << stage_idx) : 1
+
+    @device
+    mbarrier_arrive_and_expect_tx(mbar_ptr: uint64_t*, num_bytes: int)
+        用途: 到达 mbarrier 并声明预期传输字节数
+        调用: asm("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%1], %0;")
+
+    @device
+    mbarrier_arrive(mbar_ptr: uint64_t*)
+        用途: 到达 mbarrier（无预期传输）
+        调用: asm("mbarrier.arrive.shared::cta.b64 _, [%0];")
+
+### TMA 传输操作
+
+【函数】
+    @device
+    tma_load_1d(
+        smem_ptr: const void*,
+        gmem_ptr: const void*,
+        mbar_ptr: uint64_t*,
+        num_bytes: int,
+        evict_first: bool = true
+    )
+        用途: 1D TMA 异步加载（全局内存 → 共享内存）
+        调用: asm("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;")
+        
+        配置:
+            cache_hint = evict_first ? 0x12f0000000000000 : 0x1000000000000000
+
+    @device
+    tma_store_1d(
+        smem_ptr: const void*,
+        gmem_ptr: const void*,
+        num_bytes: int,
+        evict_first: bool = true
+    )
+        用途: 1D TMA 异步存储（共享内存 → 全局内存）
+        调用: asm("cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint [%0], [%1], %2, %3;")
+        后续: asm("cp.async.bulk.commit_group;")
+
+    @device
+    tma_store_fence()
+        用途: TMA 存储屏障（确保存储完成）
+        调用: asm("fence.proxy.async.shared::cta;")
+
+    @device
+    template<int N>
+    tma_store_wait()
+        用途: 等待 TMA 存储组完成（至多 N 个未完成组）
+        调用: asm("cp.async.bulk.wait_group.read %0;")
+
+【备注】
+    - 所有 TMA 指令仅在 SM90（Hopper）架构可用
+    - evict_first: 优先驱逐 L2 缓存（适用于一次性数据）
+
+---
+
+## 数学工具函数
+
+【函数】
+    @host @device
+    template<dtype_t>
+    ceil_div(a: dtype_t, b: dtype_t) -> dtype_t
+        用途: 向上整除
+        算法: (a + b - 1) / b
+
+    @host @device
+    template<dtype_t>
+    align_up(a: dtype_t, b: dtype_t) -> dtype_t
+        用途: 向上对齐到 b 的倍数
+        算法: ceil_div(a, b) * b
+
+    @host @device
+    template<dtype_t>
+    align_down(a: dtype_t, b: dtype_t) -> dtype_t
+        用途: 向下对齐到 b 的倍数
+        算法: (a / b) * b
+
+    @device
+    get_channel_task_range(
+        num_tokens: int,
+        num_sms: int,
+        sm_id: int,
+        token_start_idx: int&,
+        token_end_idx: int&
+    )
+        用途: 计算当前 SM 负责的 token 范围（负载均衡）
+        算法:
+            num_tokens_per_sm = ceil_div(num_tokens, num_sms)
+            token_start_idx = min(num_tokens_per_sm * sm_id, num_tokens)
+            token_end_idx = min(token_start_idx + num_tokens_per_sm, num_tokens)
+
+---
+
+## 数据打包与解包
+
+【函数】
+    @device
+    template<dtype_a_t, dtype_b_t>
+    pack2(x: dtype_a_t, y: dtype_a_t) -> dtype_b_t
+        约束: sizeof(dtype_a_t) * 2 == sizeof(dtype_b_t)
+        用途: 将两个值打包为一个更大的类型
+        算法:
+            packed = dtype_b_t{}
+            reinterpret<dtype_a_t*>(packed)[0] = x
+            reinterpret<dtype_a_t*>(packed)[1] = y
+            return packed
+
+    @device
+    template<dtype_a_t, dtype_b_t>
+    unpack2(packed: dtype_b_t, x: dtype_a_t&, y: dtype_a_t&)
+        约束: sizeof(dtype_a_t) * 2 == sizeof(dtype_b_t)
+        用途: 将打包值解包为两个独立值
+        算法:
+            x = reinterpret<const dtype_a_t*>(packed)[0]
+            y = reinterpret<const dtype_a_t*>(packed)[1]
+
+    @device
+    template<dtype_t>
+    broadcast(ptr: dtype_t&, src_lane_idx: int) -> dtype_t
+        约束: sizeof(dtype_t) % sizeof(int) == 0
+        用途: warp 内广播数据（从 src_lane_idx 广播到所有 lane）
+        算法:
+            send_int_values = reinterpret<int*>(ptr)
+            for i in range(sizeof(dtype_t) / sizeof(int)):
+                recv_int_values[i] = __shfl_sync(0xffffffff, send_int_values[i], src_lane_idx)
+            return reinterpret<dtype_t*>(recv_int_values)
+
+---
+
+## FP8 量化工具
+
+【常量】
+    kFP8Margin = 1e-4
+    kFinfoAmaxE4M3 = 448.0         # FP8 E4M3 最大值
+    kFinfoAmaxInvE4M3 = 1 / 448.0
+
+【函数】
+    @device
+    fast_pow2(x: int) -> float
+        约束: -126 <= x <= 127
+        用途: 快速计算 2ˣ（通过 IEEE 754 位操作）
+        算法:
+            bits_x = (x + 127) << 23
+            return reinterpret<float>(bits_x)
+
+    @device
+    fast_log2_ceil(x: float) -> int
+        用途: 快速计算 ⌈log₂(x)⌉
+        算法:
+            bits_x = reinterpret<uint32_t>(x)
+            exp_x = (bits_x >> 23) & 0xff
+            man_bits = bits_x & ((1 << 23) - 1)
+            return exp_x - 127 + (man_bits != 0)
+
+    @device
+    calculate_fp8_scales(
+        amax: float,
+        scale: float&,
+        scale_inv: float&,
+        round_scale: bool
+    )
+        用途: 计算 FP8 量化缩放因子
+        算法:
+            if round_scale:
+                exp_scale_inv = fast_log2_ceil(amax * kFinfoAmaxInvE4M3)
+                scale = fast_pow2(-exp_scale_inv)
+                scale_inv = fast_pow2(exp_scale_inv)
+            else:
+                scale_inv = amax * kFinfoAmaxInvE4M3
+                scale = kFinfoAmaxE4M3 / amax
+
+    @device
+    template<bool kIsUE8M0, typename out_dtype_t>
+    extract_required_scale_format(value: float) -> out_dtype_t
+        用途: 提取缩放因子为指定格式（UE8M0 或 float）
+        算法:
+            if kIsUE8M0:
+                return static_cast<uint8_t>(reinterpret<uint32_t>(value) >> 23)
+            else:
+                return value
+
+---
+
+## 多 Rank 同步屏障
+
+【函数】
+    @device
+    template<int kNumRanks, bool kSyncOnly = false>
+    barrier_block(barrier_signal_ptrs: int**, rank: int)
+        约束: kNumRanks <= blockDim.x
+        用途: 多 rank 间的块级同步屏障（系统级可见性）
+        
+        算法:
+            thread_id = threadIdx.x
+            
+            # Step 1: 内存屏障（仅非 sync-only 模式）
+            if not kSyncOnly:
+                memory_fence()
+                __syncthreads()
+            
+            # Step 2: 原子操作发信号
+            if thread_id < kNumRanks:
+                atomicAdd_system(barrier_signal_ptrs[rank][thread_id], FINISHED_SUM_TAG)
+                atomicSub_system(barrier_signal_ptrs[thread_id][rank], FINISHED_SUM_TAG)
+            
+            # Step 3: 轮询等待（带超时检查）
+            start_time = clock64()
+            while True:
+                value = thread_id < kNumRanks ? ld_volatile_global(barrier_signal_ptrs[rank][thread_id]) : 0
+                if __all_sync(0xffffffff, value <= 0):
+                    break
+                
+                if clock64() - start_time > NUM_TIMEOUT_CYCLES and thread_id < kNumRanks:
+                    printf("DeepEP timeout check failed: rank = %d, thread = %d, value = %d)\n", rank, thread_id, value)
+                    trap()
+            
+            __syncthreads()
+
+【备注】
+    - 使用系统级原子操作保证跨设备可见性
+    - 超时检测防止死锁
+
+---
+
+## CTA 级自旋锁
+
+【函数】
+    @device
+    atomic_cas_cta_acquire(addr: int*, x: int, y: int) -> int
+        用途: CTA 级 acquire 语义 CAS（Compare-And-Swap）
+        调用: asm("atom.acquire.cta.shared::cta.cas.b32 %0, [%1], %2, %3;")
+
+    @device
+    atomic_exch_cta_release(addr: int*, x: int) -> int
+        用途: CTA 级 release 语义原子交换
+        调用: asm("atom.release.cta.shared::cta.exch.b32 %0, [%1], %2;")
+
+    @device
+    acquire_lock(mutex: int*)
+        用途: 获取自旋锁
+        算法:
+            while atomic_cas_cta_acquire(mutex, 0, 1) != 0:
+                pass
+
+    @device
+    release_lock(mutex: int*)
+        用途: 释放自旋锁
+        算法:
+            atomic_exch_cta_release(mutex, 0)
+
+---
+
+## Warp 级归约
+
+### 归约操作符
+
+【类型】
+    ReduceSum<T>: (a, b) -> a + b
+    ReduceMax<T>: (a, b) -> max(a, b)
+    ReduceMin<T>: (a, b) -> min(a, b)
+    ReduceAnd<T>: (a, b) -> a & b
+    ReduceOr<T>:  (a, b) -> a | b
+
+### 统一归约接口
+
+【函数】
+    @device
+    template<int kNumLanesPerGroup, bool kIntergroupReduce, typename T, typename Op>
+    warp_reduce(value: T, op: Op) -> T
+        约束: kNumLanesPerGroup in {1, 2, 4, 8, 16, 32}
+        用途: warp 内归约（支持子 warp 和跨组归约）
+        
+        算法:
+            if kIntergroupReduce:  # 跨组归约（lane 0, 1, 2, ... 各自归约）
+                if kNumLanesPerGroup <= 1:  value = op(value, __shfl_xor_sync(0xffffffff, value, 1))
+                if kNumLanesPerGroup <= 2:  value = op(value, __shfl_xor_sync(0xffffffff, value, 2))
+                if kNumLanesPerGroup <= 4:  value = op(value, __shfl_xor_sync(0xffffffff, value, 4))
+                if kNumLanesPerGroup <= 8:  value = op(value, __shfl_xor_sync(0xffffffff, value, 8))
+                if kNumLanesPerGroup <= 16: value = op(value, __shfl_xor_sync(0xffffffff, value, 16))
+            else:  # 组内归约（每组内部归约到 lane 0）
+                if kNumLanesPerGroup >= 32: value = op(value, __shfl_xor_sync(0xffffffff, value, 16))
+                if kNumLanesPerGroup >= 16: value = op(value, __shfl_xor_sync(0xffffffff, value, 8))
+                if kNumLanesPerGroup >= 8:  value = op(value, __shfl_xor_sync(0xffffffff, value, 4))
+                if kNumLanesPerGroup >= 4:  value = op(value, __shfl_xor_sync(0xffffffff, value, 2))
+                if kNumLanesPerGroup >= 2:  value = op(value, __shfl_xor_sync(0xffffffff, value, 1))
+            return value
+
+### 便捷封装
+
+【函数】
+    @device
+    template<int kNumLanesPerGroup = 32, bool kIntergroupReduce = false, typename T>
+    warp_reduce_sum(value: T) -> T
+    warp_reduce_max(value: T) -> T
+    warp_reduce_min(value: T) -> T
+    warp_reduce_and(value: T) -> T
+    warp_reduce_or(value: T) -> T
+
+        用途: 调用 warp_reduce 的便捷包装
+
+【并行模式】
+    - kIntergroupReduce=false（默认）: 每个 kNumLanesPerGroup 组内归约到组的 lane 0
+    - kIntergroupReduce=true: 所有组的 lane 0/1/2/... 互相归约（用于多组并行）

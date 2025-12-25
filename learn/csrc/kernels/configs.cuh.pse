@@ -1,0 +1,55 @@
+--------------------------------
+CUDA内核配置常量与类型定义
+来源: csrc/kernels/configs.cuh
+--------------------------------
+
+【全局常量】
+    NUM_MAX_NVL_PEERS: int = 8                    # NVLink最大对等节点数
+    NUM_MAX_RDMA_PEERS: int = 20                  # RDMA最大对等节点数
+    NUM_WORKSPACE_BYTES: int = 32 * 1024 * 1024   # 工作空间大小(32MB)
+    NUM_MAX_LOCAL_EXPERTS: int = 1024             # 本地最大专家数
+    NUM_BUFFER_ALIGNMENT_BYTES: int = 128         # 缓冲区对齐字节数
+    
+    FINISHED_SUM_TAG: int = 1024                  # 完成求和标记
+    NUM_WAIT_NANOSECONDS: int = 500               # 等待纳秒数
+    
+    NUM_CPU_TIMEOUT_SECS: int = 100 | 10          # CPU超时秒数(普通/快速调试)
+    NUM_TIMEOUT_CYCLES: uint64 = 200G | 20G       # 超时周期数(普通/快速调试)
+    
+    LOW_LATENCY_SEND_PHASE: int = 1               # 低延迟发送阶段
+    LOW_LATENCY_RECV_PHASE: int = 2               # 低延迟接收阶段
+
+【类型定义】
+    namespace deep_ep:
+        topk_idx_t = int32_t | int64_t            # TopK索引类型，由TOPK_IDX_BITS编译期决定(32或64位)
+
+【编译期配置】
+    __CUDA_ARCH__ = 900                           # CLion IDE索引支持
+    
+    取消PyTorch限制:
+    - __CUDA_NO_HALF_CONVERSIONS__
+    - __CUDA_NO_HALF_OPERATORS__
+    - __CUDA_NO_HALF2_OPERATORS__
+    - __CUDA_NO_BFLOAT16_CONVERSIONS__
+    - __CUDA_NO_BFLOAT162_OPERATORS__
+
+【FP8类型定义(SM80架构)】
+    # Ampere不支持FP8，定义空实现
+    __nv_fp8_interpretation_t = int
+    __nv_fp8x4_e4m3 = int
+    __nv_fp8_storage_t = uint8_t
+    __NV_E4M3 = 0
+    __NV_E5M2 = 1
+
+【依赖】
+    cuda_bf16.h                                   # BF16支持
+    cuda_runtime.h                                # CUDA运行时
+    cuda_fp8.h                                    # FP8支持(SM90)
+    nvshmem.h / nvshmemx.h                        # NVSHMEM通信库
+    infiniband/mlx5dv.h                           # InfiniBand设备支持
+
+【备注】
+    - ENABLE_FAST_DEBUG定义时超时时间缩短10倍
+    - DISABLE_SM90_FEATURES定义时使用空FP8类型
+    - TOPK_IDX_BITS决定topk_idx_t位宽(32/64)，影响索引范围
+    - 取消PyTorch的half/bfloat16限制以使用原生CUDA类型

@@ -1,0 +1,193 @@
+# Buffer 管理结构
+
+## Buffer<dtype_t>
+
+**来源**: csrc/kernels/buffer.cuh
+
+**用途**: 简单线性缓冲区，用于单 rank 场景
+
+---
+
+### 状态
+
+```
+ptr: uint8_t*           # 缓冲区起始指针
+total_bytes: int64      # 缓冲区总字节数
+```
+
+---
+
+### 接口
+
+```
+@device
+Buffer()
+    用途: 默认构造，初始化为空缓冲区
+
+@device
+Buffer(gbl_ptr: void*&, num_elems: int, offset: int = 0)
+    参数:
+        gbl_ptr  = 全局指针引用，函数内会前移 total_bytes
+        num_elems = 元素数量
+        offset   = 起始偏移（元素为单位）
+    用途: 从全局指针分配缓冲区，自动推进全局指针
+
+@device
+advance_also(gbl_ptr: void*&) -> Buffer
+    用途: 推进全局指针 total_bytes，返回自身（链式调用）
+
+@device
+buffer() -> dtype_t*
+    用途: 获取类型化指针
+
+@device
+operator[](idx: int) -> dtype_t&
+    用途: 索引访问
+```
+
+---
+
+## AsymBuffer<dtype_t, kNumRanks>
+
+**来源**: csrc/kernels/buffer.cuh
+
+**用途**: 非对称缓冲区，支持多 rank、多 SM 的异构内存布局
+
+---
+
+### 状态
+
+```
+ptrs: uint8_t*[kNumRanks]   # 每个 rank 的缓冲区指针
+num_bytes: int64            # 单个 rank 的缓冲区字节数
+total_bytes: int64          # 所有 rank * 所有 SM 的总字节数
+```
+
+---
+
+### 接口
+
+```
+@device
+AsymBuffer(
+    gbl_ptr: void*&,
+    num_elems: int,
+    num_ranks: int,
+    sm_id: int = 0,
+    num_sms: int = 1,
+    offset: int = 0
+)
+    约束: kNumRanks == 1
+    用途: 单指针模式，分配 (num_ranks * num_sms) 个缓冲区块
+    布局: per_channel_bytes = num_bytes * num_ranks
+          total_bytes = per_channel_bytes * num_sms
+          ptrs[0] = gbl_ptr + per_channel_bytes * sm_id + num_bytes * offset
+
+@device
+AsymBuffer(
+    gbl_ptrs: void**,
+    num_elems: int,
+    num_ranks: int,
+    sm_id: int = 0,
+    num_sms: int = 1,
+    offset: int = 0
+)
+    约束: kNumRanks > 1
+    用途: 多指针模式，每个 rank 独立推进其全局指针
+    布局: 对每个 i in [0, kNumRanks):
+              ptrs[i] = gbl_ptrs[i] + per_channel_bytes * sm_id + num_bytes * offset
+              gbl_ptrs[i] += total_bytes
+
+@device
+advance(shift: int)
+    用途: 平移所有 rank 的指针 (shift * sizeof(dtype_t)) 字节
+
+@device
+advance_also(gbl_ptr: void*&) -> AsymBuffer
+    约束: kNumRanks == 1
+    用途: 推进单个全局指针，返回自身
+
+@device
+advance_also<kNumAlsoRanks>(gbl_ptrs: void**) -> AsymBuffer
+    用途: 推进多个全局指针（数量可与 kNumRanks 不同）
+
+@device
+buffer(idx: int = 0) -> dtype_t*
+    约束: kNumRanks == 1
+    用途: 获取第 idx 个 buffer 的指针
+    计算: ptrs[0] + num_bytes * idx
+
+@device
+buffer_by(rank_idx: int, idx: int = 0) -> dtype_t*
+    约束: kNumRanks > 1
+    用途: 获取 rank_idx 的第 idx 个 buffer
+    计算: ptrs[rank_idx] + num_bytes * idx
+```
+
+---
+
+## SymBuffer<dtype_t, kDecoupled>
+
+**来源**: csrc/kernels/buffer.cuh
+
+**用途**: 对称缓冲区，支持发送/接收解耦（all-to-all 通信）
+
+---
+
+### 状态
+
+```
+send_ptr: uint8_t*      # 发送缓冲区指针
+recv_ptr: uint8_t*      # 接收缓冲区指针（kDecoupled=false 时不使用）
+num_bytes: int64        # 单个 rank 的缓冲区字节数
+total_bytes: int64      # 总字节数
+```
+
+---
+
+### 接口
+
+```
+@device
+SymBuffer(
+    gbl_ptr: void*&,
+    num_elems: int,
+    num_ranks: int,
+    sm_id: int = 0,
+    num_sms: int = 1
+)
+    用途: 分配对称缓冲区
+    布局: per_channel_bytes = num_bytes * num_ranks
+          factor = kDecoupled ? 2 : 1
+          total_bytes = per_channel_bytes * num_sms * factor
+          send_ptr = gbl_ptr + per_channel_bytes * sm_id
+          recv_ptr = gbl_ptr + per_channel_bytes * (sm_id + num_sms)  # 仅 kDecoupled=true
+
+@device
+send_buffer(idx: int = 0) -> dtype_t*
+    约束: kDecoupled == true
+    用途: 获取第 idx 个发送 buffer
+    计算: send_ptr + num_bytes * idx
+
+@device
+recv_buffer(idx: int = 0) -> dtype_t*
+    约束: kDecoupled == true
+    用途: 获取第 idx 个接收 buffer
+    计算: recv_ptr + num_bytes * idx
+
+@device
+buffer(idx: int = 0) -> dtype_t*
+    约束: kDecoupled == false
+    用途: 获取第 idx 个 buffer（发送/接收共享）
+    计算: send_ptr + num_bytes * idx
+```
+
+---
+
+### 关键设计
+
+1. **Buffer**: 最简单，单指针线性分配
+2. **AsymBuffer**: 支持多 rank、多 SM 的复杂布局，提供两种初始化模式（单指针/多指针）
+3. **SymBuffer**: 对称通信专用，可选解耦发送/接收缓冲区（节省内存 vs 避免冲突）
+
+所有 Buffer 类型都支持 `advance_also` 链式调用，用于连续分配多个缓冲区。

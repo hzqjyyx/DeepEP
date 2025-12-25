@@ -1,0 +1,155 @@
+--------------------------------
+intranode::barrier (kernel)
+来源: csrc/kernels/runtime.cu
+--------------------------------
+
+【签名】
+    @device
+    barrier<kNumRanks>(barrier_signal_ptrs: int*[kNumRanks], rank: int) -> void
+
+【算法】
+    barrier_block<kNumRanks>(barrier_signal_ptrs, rank)
+
+【并行模式】
+    block-level synchronization
+
+【备注】
+    - barrier_block: 设备端 block 级别的屏障同步实现（定义在 utils.cuh）
+    - kNumRanks: 编译期常量，参与屏障同步的 rank 数量
+
+--------------------------------
+intranode::barrier (host)
+来源: csrc/kernels/runtime.cu
+--------------------------------
+
+【签名】
+    @host→device
+    barrier(barrier_signal_ptrs: int*[num_ranks], rank: int, num_ranks: int, stream: cudaStream_t) -> void
+
+【算法】
+    SETUP_LAUNCH_CONFIG(1, 32, stream)
+    SWITCH_RANKS(BARRIER_LAUNCH_CASE)
+    
+    # BARRIER_LAUNCH_CASE(ranks):
+    #     LAUNCH_KERNEL(&cfg, barrier<ranks>, barrier_signal_ptrs, rank)
+
+【备注】
+    - SWITCH_RANKS: 根据 num_ranks 在编译期实例化对应的 barrier<kNumRanks> 模板
+    - 使用单个 block，32 个线程
+
+--------------------------------
+internode::get_unique_id
+来源: csrc/kernels/runtime.cu
+--------------------------------
+
+【签名】
+    get_unique_id() -> vector<uint8_t>
+
+【算法】
+    nvshmemx_get_uniqueid(&unique_id)
+    return memcpy(unique_id)
+
+【备注】
+    - 需要 NVSHMEM 支持
+    - 返回 NVSHMEM 通信组的唯一 ID，用于多节点初始化
+
+--------------------------------
+internode::init
+来源: csrc/kernels/runtime.cu
+--------------------------------
+
+【签名】
+    init(
+        root_unique_id_val: vector<uint8_t>,
+        rank: int,
+        num_ranks: int,
+        low_latency_mode: bool
+    ) -> int
+
+【算法】
+    # Step 1: 初始化 NVSHMEM
+    memcpy(&root_unique_id, root_unique_id_val.data())
+    nvshmemx_set_attr_uniqueid_args(rank, num_ranks, &root_unique_id, &attr)
+    nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr)
+    
+    # Step 2: 创建子 RDMA 通信组（low-latency 模式专用）
+    if low_latency_mode and num_ranks > NUM_MAX_NVL_PEERS:
+        # 按 NVLink 拓扑划分 RDMA 通信组
+        # 每组大小为 NUM_MAX_NVL_PEERS，组间使用 RDMA
+        nvshmem_team_split_strided(
+            NVSHMEM_TEAM_WORLD,
+            PE_start = rank % NUM_MAX_NVL_PEERS,
+            PE_stride = NUM_MAX_NVL_PEERS,
+            PE_size = num_ranks / NUM_MAX_NVL_PEERS,
+            config = &cpu_rdma_team_config,
+            config_mask = 0,
+            new_team = &cpu_rdma_team
+        )
+    
+    # Step 3: 全局屏障
+    nvshmem_barrier_all()
+    
+    return nvshmem_my_pe()
+
+【备注】
+    - NUM_MAX_NVL_PEERS: NVLink 直连的最大 GPU 数量
+    - cpu_rdma_team: 全局变量，存储子通信组句柄
+    - 子通信组策略：将 num_ranks 个 GPU 划分为 num_ranks/NUM_MAX_NVL_PEERS 组，每组内使用 NVLink，组间使用 RDMA
+
+--------------------------------
+internode::alloc
+来源: csrc/kernels/runtime.cu
+--------------------------------
+
+【签名】
+    alloc(size: size_t, alignment: size_t) -> void*
+
+【算法】
+    return nvshmem_align(alignment, size)
+
+【备注】
+    - 分配对称内存（所有 PE 在相同虚拟地址分配相同大小）
+    - 用于 RDMA 通信缓冲区
+
+--------------------------------
+internode::free
+来源: csrc/kernels/runtime.cu
+--------------------------------
+
+【签名】
+    free(ptr: void*) -> void
+
+【算法】
+    nvshmem_free(ptr)
+
+--------------------------------
+internode::barrier
+来源: csrc/kernels/runtime.cu
+--------------------------------
+
+【签名】
+    barrier() -> void
+
+【算法】
+    nvshmem_barrier_all()
+
+【备注】
+    - 全局屏障，阻塞直到所有 PE 到达
+
+--------------------------------
+internode::finalize
+来源: csrc/kernels/runtime.cu
+--------------------------------
+
+【签名】
+    finalize() -> void
+
+【算法】
+    if cpu_rdma_team != NVSHMEM_TEAM_INVALID:
+        nvshmem_team_destroy(cpu_rdma_team)
+        cpu_rdma_team = NVSHMEM_TEAM_INVALID
+    
+    nvshmem_finalize()
+
+【备注】
+    - 清理 NVSHMEM 资源，销毁子通信组

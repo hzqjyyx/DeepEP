@@ -1,0 +1,698 @@
+# IBGDA Device Operations (InfiniBand GPUDirect Async)
+
+## 文件概述
+- 来源: csrc/kernels/ibgda_device.cuh
+- 派生自: NVSHMEM ibgda_device.cuh
+- 用途: GPU侧的RDMA直接内存访问原语，支持NVLink和InfiniBand通信
+
+---
+
+## 字节序转换工具
+
+--------------------------------
+HtoBE64/HtoBE32/HtoBE16
+来源: ibgda_device.cuh
+--------------------------------
+
+【签名】
+    @device
+    HtoBE64(x: uint64) -> uint64
+    HtoBE32(x: uint32) -> uint32
+    HtoBE16(x: uint16) -> uint16
+
+【算法】
+    # 使用PTX prmt指令完成host到big-endian的字节序转换
+    # 64位: 拆分为(lo, hi)，分别转换后重组为(new_lo, new_hi)
+    # 32位: 使用0x0123掩码重排字节
+    # 16位: 使用0x4401掩码重排字节
+    
+    return 字节序转换后的值
+
+【备注】
+    - 用于构造符合InfiniBand规范的WQE (Work Queue Element)
+    - inline PTX汇编实现，零开销
+
+---
+
+## 队列对(QP)管理
+
+--------------------------------
+ibgda_get_state
+来源: ibgda_device.cuh
+--------------------------------
+
+【签名】
+    @device
+    ibgda_get_state() -> nvshmemi_ibgda_device_state_t*
+
+【算法】
+    return &nvshmemi_ibgda_device_state_d
+
+【备注】
+    - 返回全局IBGDA状态结构指针
+
+---
+
+--------------------------------
+ibgda_get_rc
+来源: ibgda_device.cuh
+--------------------------------
+
+【签名】
+    @device
+    ibgda_get_rc(pe: int, id: int) -> nvshmemi_ibgda_device_qp_t*
+
+【算法】
+    state = ibgda_get_state()
+    num_rc_per_pe = state.num_rc_per_pe
+    
+    # 计算QP索引: (pe * num_rc_per_pe * num_devices + id) % (num_rc_per_pe * num_devices)
+    qp_idx = pe * num_rc_per_pe * state.num_devices_initialized + 
+             id % (num_rc_per_pe * state.num_devices_initialized)
+    
+    return &state.globalmem.rcs[qp_idx]
+
+【备注】
+    - RC (Reliable Connection): InfiniBand可靠连接队列对
+    - 支持多设备和多QP负载均衡
+
+---
+
+## 锁操作
+
+--------------------------------
+ibgda_lock_acquire/release
+来源: ibgda_device.cuh
+--------------------------------
+
+【签名】
+    @device
+    ibgda_lock_acquire(lock: int*)
+    ibgda_lock_release(lock: int*)
+
+【算法】
+    # Acquire
+    while atomicCAS(lock, 0, 1) == 1:
+        pass
+    memory_fence_cta()
+
+    # Release
+    memory_fence_cta()
+    st_na_relaxed(lock, 0)
+
+【并行模式】
+    spinlock + memory fence保证CTA内可见性
+
+---
+
+## Doorbell操作
+
+--------------------------------
+ibgda_update_dbr
+来源: ibgda_device.cuh
+--------------------------------
+
+【签名】
+    @device
+    ibgda_update_dbr(qp: nvshmemi_ibgda_device_qp_t*, dbrec_head: uint32)
+
+【算法】
+    # DBREC (Doorbell Record): 指向下一个空WQEBB的索引
+    # 使用PTX直接将dbrec_head[15:0]转换为big-endian并存储
+    dbrec_val = HtoBE32(dbrec_head & 0xffff)
+    st_na_release(qp.tx_wq.dbrec, dbrec_val)
+
+【备注】
+    - release语义: 保证WQE写入对NIC可见
+
+---
+
+--------------------------------
+ibgda_ring_db
+来源: ibgda_device.cuh
+--------------------------------
+
+【签名】
+    @device
+    ibgda_ring_db(qp: nvshmemi_ibgda_device_qp_t*, prod_idx: uint16)
+
+【算法】
+    # 构造控制段并写入BlueFlame寄存器
+    ctrl_seg.opmod_idx_opcode = HtoBE32(prod_idx << 8)
+    ctrl_seg.qpn_ds = HtoBE32(qp.qpn << 8)
+    
+    st_na_release(qp.tx_wq.bf, *(uint64*)&ctrl_seg)
+
+【备注】
+    - BlueFlame: Mellanox NIC的用户态doorbell寄存器
+    - 单次8字节写触发NIC DMA
+
+---
+
+--------------------------------
+ibgda_post_send
+来源: ibgda_device.cuh
+--------------------------------
+
+【签名】
+    @device
+    ibgda_post_send(qp: nvshmemi_ibgda_device_qp_t*, new_prod_idx: uint64)
+
+【算法】
+    ibgda_lock_acquire(&qp.mvars.post_send_lock)
+    
+    old_prod_idx = atomicMax(&qp.mvars.tx_wq.prod_idx, new_prod_idx)
+    if new_prod_idx > old_prod_idx:
+        ibgda_update_dbr(qp, new_prod_idx)
+        ibgda_ring_db(qp, new_prod_idx)
+    
+    ibgda_lock_release(&qp.mvars.post_send_lock)
+
+【备注】
+    - atomicMax避免旧WQE覆盖新WQE的doorbell
+    - 只有最大prod_idx的线程才触发doorbell
+
+---
+
+## WQE提交流水线
+
+--------------------------------
+ibgda_submit_requests
+来源: ibgda_device.cuh
+--------------------------------
+
+【签名】
+    @device
+    ibgda_submit_requests<kAlwaysDoPostSend: bool>(
+        qp: nvshmemi_ibgda_device_qp_t*,
+        base_wqe_idx: uint64,
+        num_wqes: uint32,
+        message_idx: int = 0
+    )
+
+【算法】
+    new_wqe_idx = base_wqe_idx + num_wqes
+    
+    # Step 1: 等待WQE写入完成
+    __threadfence()
+    
+    # Step 2: 选择同步点
+    ready_idx = state.use_async_postsend ? qp.tx_wq.prod_idx : &qp.mvars.tx_wq.ready_head
+    
+    # Step 3: 等待前序WQE槽位填充完成
+    while atomicCAS(ready_idx, base_wqe_idx, new_wqe_idx) != base_wqe_idx:
+        pass
+    
+    # Step 4: 批量提交 (非异步模式)
+    if not state.use_async_postsend:
+        if kAlwaysDoPostSend or (message_idx + 1) % 4 == 0:
+            ibgda_post_send(qp, new_wqe_idx)
+
+【并行模式】
+    - 多线程可并发reserve WQE槽位
+    - atomicCAS保证WQE按base_wqe_idx顺序提交
+    - 批量大小: 4个请求/批
+
+【备注】
+    - use_async_postsend: 由专用线程异步调用ibgda_post_send
+    - kAlwaysDoPostSend: 强制每次都post (低延迟模式)
+
+---
+
+## Key管理
+
+--------------------------------
+ibgda_get_lkey_and_rkey
+来源: ibgda_device.cuh
+--------------------------------
+
+【签名】
+    @device
+    ibgda_get_lkey_and_rkey(
+        laddr: uint64, lkey: __be32*,           # 本地地址和key输出
+        raddr: uint64, dst_pe: int,              # 远程地址和PE
+        out_raddr: uint64*, out_rkey: __be32*,   # 远程地址和key输出
+        dev_idx: uint32
+    ) -> uint64                                   # 返回本次可传输的最大字节数
+
+【算法】
+    state = ibgda_get_state()
+    heap_start = nvshmemi_device_state_d.heap_base
+    log2_gran = state.log2_cumem_granularity
+    
+    # Local key
+    lidx = ((laddr - heap_start) >> log2_gran) * state.num_devices_initialized + dev_idx
+    lkey_entry = state.constmem.lkeys[lidx]
+    *lkey = lkey_entry.key
+    lchunk_size = lkey_entry.next_addr - laddr
+    
+    # Remote key
+    roffset = raddr - heap_start
+    ridx = ((roffset >> log2_gran) * npes) * state.num_devices_initialized + 
+           dst_pe * state.num_devices_initialized + dev_idx
+    
+    if ridx < NVSHMEMI_IBGDA_MAX_CONST_RKEYS:
+        rkey_entry = state.constmem.rkeys[ridx]
+    else:
+        rkey_entry = state.globalmem.rkeys[ridx - NVSHMEMI_IBGDA_MAX_CONST_RKEYS]
+    
+    *out_raddr = nvshmemi_device_state_d.peer_heap_base_remote[dst_pe] + roffset
+    *out_rkey = rkey_entry.key
+    rchunk_size = rkey_entry.next_addr - roffset
+    
+    return min(lchunk_size, rchunk_size)
+
+【备注】
+    - 返回值: 本次传输不跨越内存注册边界的最大字节数
+    - 分层存储: constmem存前NVSHMEMI_IBGDA_MAX_CONST_RKEYS个rkey
+    - log2_cumem_granularity: CUDA内存注册粒度的log2值
+
+---
+
+--------------------------------
+ibgda_get_rkey
+来源: ibgda_device.cuh
+--------------------------------
+
+【签名】
+    @device
+    ibgda_get_rkey(
+        addr: uint64, dst_pe: int,
+        out_raddr: uint64*, out_rkey: __be32*,
+        dev_idx: uint32
+    )
+
+【算法】
+    # 简化版ibgda_get_lkey_and_rkey，仅获取remote key
+    state = ibgda_get_state()
+    heap_start = nvshmemi_device_state_d.heap_base
+    roffset = addr - heap_start
+    
+    idx = ((roffset >> state.log2_cumem_granularity) * npes * state.num_devices_initialized) +
+          dst_pe * state.num_devices_initialized + dev_idx
+    
+    if idx < NVSHMEMI_IBGDA_MAX_CONST_RKEYS:
+        device_key = state.constmem.rkeys[idx]
+    else:
+        device_key = state.globalmem.rkeys[idx - NVSHMEMI_IBGDA_MAX_CONST_RKEYS]
+    
+    *out_raddr = nvshmemi_device_state_d.peer_heap_base_remote[dst_pe] + roffset
+    *out_rkey = device_key.key
+
+---
+
+## WQE构造函数
+
+--------------------------------
+ibgda_reserve_wqe_slots
+来源: ibgda_device.cuh
+--------------------------------
+
+【签名】
+    @device
+    ibgda_reserve_wqe_slots(qp: nvshmemi_ibgda_device_qp_t*, num_wqes: uint32) -> uint64
+
+【算法】
+    return atomicAdd(&qp.mvars.tx_wq.resv_head, num_wqes)
+
+【备注】
+    - 返回base_wqe_idx，调用者拥有[base, base+num_wqes)槽位
+
+---
+
+--------------------------------
+ibgda_get_wqe_ptr
+来源: ibgda_device.cuh
+--------------------------------
+
+【签名】
+    @device
+    ibgda_get_wqe_ptr(qp: nvshmemi_ibgda_device_qp_t*, wqe_idx: uint16) -> void*
+
+【算法】
+    cnt = qp.tx_wq.nwqes
+    idx = wqe_idx & (cnt - 1)  # 环形队列取模
+    return qp.tx_wq.wqe + (idx << MLX5_SEND_WQE_SHIFT)
+
+【备注】
+    - MLX5_SEND_WQE_SHIFT = 6 (64字节对齐)
+    - nwqes必须是2的幂
+
+---
+
+--------------------------------
+ibgda_write_rdma_write_inl_wqe
+来源: ibgda_device.cuh
+--------------------------------
+
+【签名】
+    @device
+    ibgda_write_rdma_write_inl_wqe(
+        qp: nvshmemi_ibgda_device_qp_t*,
+        val: uint32*,                        # 要写入的4字节值
+        raddr: uint64, rkey: __be32,         # 远程地址和key
+        wqe_idx: uint16,
+        out_wqes: void**,                    # WQE缓冲区指针
+        imm: uint32 = std::numeric_limits<uint32>::max()  # immediate数据
+    )
+
+【算法】
+    # 构造WQE段
+    ctrl_seg.qpn_ds = HtoBE32((qp.qpn << 8) | 3)  # 3个段
+    ctrl_seg.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE
+    ctrl_seg.opmod_idx_opcode = HtoBE32((wqe_idx << 8) | 
+        (imm != MAX ? MLX5_OPCODE_RDMA_WRITE_IMM : MLX5_OPCODE_RDMA_WRITE))
+    if imm != MAX:
+        ctrl_seg.imm = HtoBE32(imm)
+    
+    raddr_seg.raddr = HtoBE64(raddr)
+    raddr_seg.rkey = rkey
+    raddr_seg.reserved = 0
+    
+    inl_seg.byte_count = HtoBE32(4 | MLX5_INLINE_SEG)
+    
+    # 写入WQE (relaxed语义，submit时有fence)
+    st_na_relaxed(&out_wqes[0], ctrl_seg)        # 16B
+    st_na_relaxed(&out_wqes[0] + 16, raddr_seg)  # 16B
+    st_na_relaxed(&out_wqes[0] + 32, inl_seg)    # 4B
+    st_na_relaxed(&out_wqes[0] + 36, *val)       # 4B
+
+【备注】
+    - 用于4字节RDMA Write (如原子操作的信号量)
+    - imm == MAX: 无immediate数据的普通RDMA Write
+
+---
+
+--------------------------------
+ibgda_write_rdma_write_wqe
+来源: ibgda_device.cuh
+--------------------------------
+
+【签名】
+    @device
+    ibgda_write_rdma_write_wqe(
+        qp: nvshmemi_ibgda_device_qp_t*,
+        laddr: uint64, lkey: __be32,      # 本地地址和key
+        raddr: uint64, rkey: __be32,      # 远程地址和key
+        bytes: uint32,
+        wqe_idx: uint16,
+        out_wqes: void**
+    )
+
+【算法】
+    ctrl_seg.qpn_ds = HtoBE32((qp.qpn << 8) | 3)
+    ctrl_seg.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE
+    ctrl_seg.opmod_idx_opcode = HtoBE32((wqe_idx << 8) | MLX5_OPCODE_RDMA_WRITE)
+    
+    raddr_seg.raddr = HtoBE64(raddr)
+    raddr_seg.rkey = rkey
+    raddr_seg.reserved = 0
+    
+    data_seg.byte_count = HtoBE32(bytes)
+    data_seg.lkey = lkey
+    data_seg.addr = HtoBE64(laddr)
+    
+    st_na_relaxed(&out_wqes[0], ctrl_seg)        # 16B
+    st_na_relaxed(&out_wqes[0] + 16, raddr_seg)  # 16B
+    st_na_relaxed(&out_wqes[0] + 32, data_seg)   # 16B
+
+【备注】
+    - 用于大块数据RDMA Write
+
+---
+
+--------------------------------
+ibgda_write_empty_recv_wqe
+来源: ibgda_device.cuh
+--------------------------------
+
+【签名】
+    @device
+    ibgda_write_empty_recv_wqe(out_wqe: void*)
+
+【算法】
+    data_seg.byte_count = 0
+    data_seg.lkey = HtoBE64(MLX5_INVALID_LKEY)
+    data_seg.addr = 0
+    
+    st_na_relaxed(out_wqe, data_seg)
+
+【备注】
+    - 用于invalidate接收队列的第一个段
+    - 整个WQE列表将无效
+
+---
+
+--------------------------------
+ibgda_write_amo_add_wqe
+来源: ibgda_device.cuh
+--------------------------------
+
+【签名】
+    @device
+    ibgda_write_amo_add_wqe(
+        qp: nvshmemi_ibgda_device_qp_t*,
+        value: int,                       # 要加的值
+        laddr: uint64, lkey: __be32,      # 本地缓冲区 (存返回值)
+        raddr: uint64, rkey: __be32,      # 远程原子变量
+        wqe_idx: uint16,
+        out_wqes: void**
+    )
+
+【算法】
+    ctrl_seg.opmod_idx_opcode = HtoBE32(
+        MLX5_OPCODE_ATOMIC_MASKED_FA | (wqe_idx << 8) | 0x08000000)  # 4字节扩展原子
+    ctrl_seg.qpn_ds = HtoBE32((qp.qpn << 8) | 4)  # 4个段
+    ctrl_seg.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE
+    
+    raddr_seg.raddr = HtoBE64(raddr)
+    raddr_seg.rkey = rkey
+    raddr_seg.reserved = 0
+    
+    atomic_seg.add_data = HtoBE32(value)
+    atomic_seg.field_boundary = 0
+    
+    data_seg.byte_count = HtoBE32(sizeof(int))
+    data_seg.lkey = lkey
+    data_seg.addr = HtoBE64(laddr)
+    
+    st_na_relaxed(&out_wqes[0], ctrl_seg)        # 16B
+    st_na_relaxed(&out_wqes[0] + 16, raddr_seg)  # 16B
+    st_na_relaxed(&out_wqes[0] + 32, atomic_seg) # 16B
+    st_na_relaxed(&out_wqes[0] + 48, data_seg)   # 16B
+
+【备注】
+    - MASKED_FA: Masked Fetch-And-Add
+    - 0x08000000: IBGDA_4_BYTE_EXT_AMO_OPMOD
+    - 返回值写入laddr
+
+---
+
+## 高级操作
+
+--------------------------------
+nvshmemi_ibgda_rma_p
+来源: ibgda_device.cuh
+--------------------------------
+
+【签名】
+    @device
+    nvshmemi_ibgda_rma_p(
+        rptr: int*, value: int, dst_pe: int, qp_id: int,
+        imm: uint32 = std::numeric_limits<uint32>::max()
+    )
+
+【算法】
+    qp = ibgda_get_rc(dst_pe, qp_id)
+    ibgda_get_rkey(rptr, dst_pe, &raddr, &rkey, qp.dev_idx)
+    
+    base_wqe_idx = ibgda_reserve_wqe_slots(qp, 1)
+    wqe_ptr = ibgda_get_wqe_ptr(qp, base_wqe_idx)
+    ibgda_write_rdma_write_inl_wqe(qp, &value, raddr, rkey, base_wqe_idx, &wqe_ptr, imm)
+    
+    ibgda_submit_requests<true>(qp, base_wqe_idx, 1)
+
+【备注】
+    - 单个int的RDMA Write (Put)
+    - kAlwaysDoPostSend=true: 立即doorbell
+
+---
+
+--------------------------------
+nvshmemi_ibgda_put_nbi_warp
+来源: ibgda_device.cuh
+--------------------------------
+
+【签名】
+    @device
+    nvshmemi_ibgda_put_nbi_warp<kAlwaysDoPostSend: bool>(
+        req_rptr: uint64, req_lptr: uint64, bytes: size_t,
+        dst_pe: int, qp_id: int,
+        lane_id: int, message_idx: int
+    )
+
+【算法】
+    qp = ibgda_get_rc(dst_pe, qp_id)
+    
+    # Phase 1: 每个lane计算自己的chunk (最多32个chunk)
+    num_wqes = 0
+    remaining_bytes = bytes
+    while remaining_bytes > 0:
+        if lane_id == num_wqes:
+            my_chunk_size = min(remaining_bytes,
+                ibgda_get_lkey_and_rkey(req_lptr, &my_lkey, req_rptr, dst_pe, 
+                                        &my_raddr, &my_rkey, qp.dev_idx))
+        
+        chunk_size = __shfl_sync(0xffffffff, my_chunk_size, num_wqes)
+        remaining_bytes -= chunk_size
+        req_lptr += chunk_size
+        req_rptr += chunk_size
+        num_wqes++
+    
+    # Phase 2: Lane 0 reserve WQE槽位
+    if lane_id == 0:
+        base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes)
+    base_wqe_idx = __shfl_sync(0xffffffff, base_wqe_idx, 0)
+    
+    # Phase 3: 每个活跃lane构造自己的WQE
+    if lane_id < num_wqes:
+        wqe_ptr = ibgda_get_wqe_ptr(qp, base_wqe_idx + lane_id)
+        ibgda_write_rdma_write_wqe(qp, my_laddr, my_lkey, my_raddr, my_rkey,
+                                    my_chunk_size, base_wqe_idx + lane_id, &wqe_ptr)
+    __syncwarp()
+    
+    # Phase 4: Lane 0 提交
+    if lane_id == 0:
+        ibgda_submit_requests<kAlwaysDoPostSend>(qp, base_wqe_idx, num_wqes, message_idx)
+    __syncwarp()
+
+【并行模式】
+    - Warp协作: 32个lane并行处理最多32个chunk
+    - __shfl_sync: warp内通信chunk大小
+    - __syncwarp: 同步WQE写入和提交
+
+【备注】
+    - 用于大块数据Put，自动处理内存注册边界跨越
+    - 最多32个chunk限制来自warp大小
+
+---
+
+--------------------------------
+nvshmemi_ibgda_amo_nonfetch_add
+来源: ibgda_device.cuh
+--------------------------------
+
+【签名】
+    @device
+    nvshmemi_ibgda_amo_nonfetch_add(
+        rptr: void*, value: int, pe: int, qp_id: int,
+        is_local_copy: bool = false
+    )
+
+【算法】
+    if is_local_copy:
+        atomicAdd(rptr, value)
+    else:
+        qp = ibgda_get_rc(pe, qp_id)
+        ibgda_get_rkey(rptr, pe, &raddr, &rkey, qp.dev_idx)
+        
+        wqe_idx = ibgda_reserve_wqe_slots(qp, 1)
+        wqe_ptr = ibgda_get_wqe_ptr(qp, wqe_idx)
+        ibgda_write_amo_add_wqe(qp, value, qp.ibuf.buf, qp.ibuf.lkey,
+                                 raddr, rkey, wqe_idx, &wqe_ptr)
+        
+        ibgda_submit_requests<true>(qp, wqe_idx, 1)
+
+【备注】
+    - 非取值原子加 (Fire-and-forget)
+    - qp.ibuf.buf: 临时缓冲区存储返回值 (但调用者不关心)
+
+---
+
+## NVLink P2P工具
+
+--------------------------------
+nvshmemi_get_p2p_ptr
+来源: ibgda_device.cuh
+--------------------------------
+
+【签名】
+    @device
+    nvshmemi_get_p2p_ptr(ptr: uint64, rank: int, dst_rank: int) -> uint64
+
+【算法】
+    if rank == dst_rank:
+        return ptr
+    
+    peer_base = nvshmemi_device_state_d.peer_heap_base_p2p[dst_rank]
+    
+    if peer_base == 0:
+        return 0  # NVLink未连接
+    
+    offset = ptr - nvshmemi_device_state_d.heap_base
+    return peer_base + offset
+
+【备注】
+    - 将本地堆指针映射为远程GPU的P2P可访问地址
+    - 返回0表示需要走RDMA路径
+
+---
+
+## CQ轮询
+
+--------------------------------
+ibgda_poll_cq
+来源: ibgda_device.cuh
+--------------------------------
+
+【签名】
+    @device
+    ibgda_poll_cq(cq: nvshmemi_ibgda_device_cq_t*, idx: uint64)
+
+【算法】
+    cqe64 = cq.cqe
+    ncqes = cq.ncqes
+    memory_fence_cta()
+    
+    if *cq.cons_idx >= idx:
+        return  # 已完成
+    
+    # 轮询直到HW wqe_counter追上idx
+    # wqe_counter是uint16_t，使用溢出安全的比较:
+    # (idx - wqe_counter - 2) < ncqes 表示 wqe_counter + 1 < idx
+    do:
+        wqe_counter = HtoBE16(ld_na_relaxed(&cqe64.wqe_counter))
+    while (uint16(idx) - wqe_counter - 2) < ncqes
+    
+    *cq.cons_idx = idx
+    memory_fence_cta()
+
+【备注】
+    - 等待WQE idx-1完成
+    - 非线程安全: 同一QP的多线程轮询需要额外同步
+    - wqe_counter实际是已完成的最大索引+1
+
+---
+
+--------------------------------
+nvshmemi_ibgda_quiet
+来源: ibgda_device.cuh
+--------------------------------
+
+【签名】
+    @device
+    nvshmemi_ibgda_quiet(dst_pe: int, qp_id: int)
+
+【算法】
+    qp = ibgda_get_rc(dst_pe, qp_id)
+    state = ibgda_get_state()
+    
+    prod_idx = state.use_async_postsend ? 
+        ld_na_relaxed(qp.tx_wq.prod_idx) : 
+        ld_na_relaxed(&qp.mvars.tx_wq.ready_head)
+    
+    ibgda_poll_cq(qp.tx_wq.cq, prod_idx)
+
+【备注】
+    - 等待所有已提交的WQE完成
+    - 同步点取决于use_async_postsend模式

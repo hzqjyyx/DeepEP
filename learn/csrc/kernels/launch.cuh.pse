@@ -1,0 +1,203 @@
+--------------------------------
+CUDA Kernel 启动配置宏
+来源: csrc/kernels/launch.cuh
+--------------------------------
+
+【功能分类】
+    1. Kernel 启动宏：封装 SM90 (Hopper) 和 SM80 (Ampere) 的 kernel 启动方式
+    2. 模板参数分发宏：将运行时参数映射到编译时模板参数
+
+---
+
+## 一、Kernel 启动宏
+
+### SETUP_LAUNCH_CONFIG(num_sms, num_threads, stream)
+
+**SM90 版本**:
+```
+cfg = cudaLaunchConfig_t {
+    gridDim: num_sms,
+    blockDim: num_threads,
+    dynamicSmemBytes: 0,
+    stream: stream
+}
+
+attr = [
+    cudaLaunchAttribute {
+        id: cudaLaunchAttributeCooperative,
+        val.cooperative: 1
+    },
+    cudaLaunchAttribute {
+        id: cudaLaunchAttributeClusterDimension,
+        val.clusterDim: {
+            x: (num_sms % 2 == 0) ? 2 : 1,
+            y: 1,
+            z: 1
+        }
+    }
+]
+
+cfg.attrs = attr
+cfg.numAttrs = 2
+```
+
+**SM80 版本**:
+```
+__num_sms = num_sms
+__num_threads = num_threads
+__stream = stream
+```
+
+**设计动机**:
+- SM90 启用 cooperative launch (允许 grid 级同步)
+- SM90 启用 cluster dimension (相邻 SM 通过 distributed shared memory 通信)
+- cluster.x = 2 当 SM 数为偶数，否则为 1
+
+---
+
+### LAUNCH_KERNEL(config, kernel, ...)
+
+**SM90 版本**:
+```
+CUDA_CHECK(cudaLaunchKernelEx(config, kernel, ...))
+```
+
+**SM80 版本**:
+```
+kernel<<<__num_sms, __num_threads, 0, __stream>>>(...)
+err = cudaGetLastError()
+if err != cudaSuccess:
+    throw EPException("CUDA", __FILE__, __LINE__, cudaGetErrorString(err))
+```
+
+---
+
+### SET_SHARED_MEMORY_FOR_TMA(kernel)
+
+**SM90 版本**:
+```
+assert cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size) == cudaSuccess
+cfg.dynamicSmemBytes = smem_size
+```
+
+**SM80 版本**:
+```
+void()
+```
+
+**设计动机**:
+- TMA (Tensor Memory Accelerator) 是 Hopper 的硬件单元，用于高效传输多维张量
+- 需要设置更大的动态共享内存上限 (默认 48KB，Hopper 支持 228KB)
+- 依赖外部变量 smem_size
+
+---
+
+## 二、模板参数分发宏
+
+### SWITCH_RANKS(case_macro)
+
+```
+switch num_ranks:
+    case 2:  case_macro(2)
+    case 4:  case_macro(4)
+    case 8:  case_macro(8)
+    default: EP_HOST_ASSERT(false and "Unsupported ranks")
+```
+
+**用途**: 将运行时 num_ranks 映射为编译时模板参数
+**支持值**: 2, 4, 8 (节点内 GPU 数量)
+
+---
+
+### SWITCH_RDMA_RANKS(case_macro)
+
+```
+switch num_ranks / NUM_MAX_NVL_PEERS:
+    case 2:  case_macro(2)
+    case 3:  case_macro(3)
+    case 4:  case_macro(4)
+    case 6:  case_macro(6)
+    case 8:  case_macro(8)
+    case 12: case_macro(12)
+    case 16: case_macro(16)
+    case 18: case_macro(18)
+    case 20: case_macro(20)
+    default: EP_HOST_ASSERT(false and "Unsupported RDMA ranks")
+```
+
+**用途**: 将运行时节点数映射为编译时模板参数
+**计算**: 节点数 = 总 GPU 数 / 每节点 GPU 数
+**支持值**: 2~20 个节点 (特定配置)
+
+---
+
+### SWITCH_RANKS_WITH_DTYPE(dtype, case_macro)
+
+```
+switch num_ranks:
+    case 2:  case_macro(dtype, 2)
+    case 4:  case_macro(dtype, 4)
+    case 8:  case_macro(dtype, 8)
+    default: EP_HOST_ASSERT(false and "Unsupported ranks")
+```
+
+**用途**: 同时分发数据类型和 rank 数
+**示例**: `case_macro(nv_bfloat16, 8)` → `kernel<nv_bfloat16, 8>(...)`
+
+---
+
+### SWITCH_TYPES(case_macro)
+
+```
+switch type:
+    case CUDA_R_16BF: case_macro(nv_bfloat16)
+    default: EP_HOST_ASSERT(false and "Unsupported type")
+```
+
+**用途**: 将 cudaDataType 枚举映射为 C++ 类型
+**当前支持**: CUDA_R_16BF → nv_bfloat16
+
+---
+
+### SWITCH_HIDDEN(case_macro)
+
+```
+switch hidden:
+    case 2048: case_macro(2048)
+    case 2560: case_macro(2560)
+    case 3072: case_macro(3072)  # for gpt-oss
+    case 4096: case_macro(4096)
+    case 5120: case_macro(5120)
+    case 6144: case_macro(6144)  # for qwen3 coder
+    case 7168: case_macro(7168)
+    case 8192: case_macro(8192)
+    default: EP_HOST_ASSERT(false and "Unsupported hidden")
+```
+
+**用途**: 将运行时 hidden dimension 映射为编译时常量
+**优化动机**:
+- 允许编译器完全展开循环
+- 优化向量化内存访问 (需要编译时已知大小和对齐)
+- 减少运行时分支
+
+---
+
+## 三、设计模式：模板实例化分发
+
+【模式】
+```
+# 定义 case_macro
+#define CALL_KERNEL(RANKS) \
+    do { kernel<RANKS>(...); return; } while(0)
+
+# 运行时分发
+SWITCH_RANKS(CALL_KERNEL);
+```
+
+【原理】
+- 编译器为每个 case 生成特化版本 (如 kernel<2>, kernel<4>, kernel<8>)
+- 运行时根据实际参数选择对应版本
+- 允许编译器针对常量参数做深度优化 (循环展开、常量折叠)
+
+【要求】
+- case_macro 内部必须 return 或 break (否则 fall-through)

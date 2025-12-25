@@ -1,0 +1,6 @@
+- **Utility functions**: `ceil_div`, `align_up`, `align_down` - 用于内存对齐和分块计算
+- **Config struct**: 存储通信缓冲区配置参数（NVL/RDMA 的分块发送/接收令牌数、SM 数量），构造函数中有断言验证参数合法性（e.g., 发送令牌数 < 接收令牌数）
+- **Buffer size hints**: `get_nvl_buffer_size_hint()` 和 `get_rdma_buffer_size_hint()` 计算所需的 GPU 内存大小，考虑了隐层维度、rank 数、TopK 索引、缩放因子等因素
+- **LowLatencyBuffer struct**: 低延迟模式下的 RDMA 发送/接收缓冲区指针和计数器，分别用于 dispatch 和 combine 操作
+- **LowLatencyLayout struct**: 管理低延迟模式的缓冲区内存布局，计算并分配两组对称的 dispatch/combine 发送、接收和信号缓冲区，支持自定义指针类型的内存地址计算
+- **get_low_latency_rdma_size_hint()**: 按 `NUM_BUFFER_ALIGNMENT_BYTES` 对齐后返回低延迟模式所需的总内存大小

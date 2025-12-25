@@ -1,0 +1,83 @@
+--------------------------------
+internode_dispatch_forward / internode_combine_forward
+来源: csrc/kernels/internode.cu
+--------------------------------
+
+【签名】
+    @device
+    internode_dispatch_forward(
+        send_ptr: float*[local_expert_cnt, max_send_tokens, hidden_size],
+        recv_ptr: float*[local_expert_cnt, max_recv_tokens, hidden_size],
+        ibgda_ptr: void*,
+        hidden_size: int,
+        rank: int,
+        world_size: int,
+        local_expert_cnt: int,
+        topk: int,
+        num_worst_tokens: int,
+        max_recv_tokens: int,
+        send_layout_ptr: layout_t*[world_size, local_expert_cnt],
+        recv_layout_ptr: layout_t*[world_size, local_expert_cnt],
+        float_config: FloatConfig,
+        config: Config
+    )
+
+    @device
+    internode_combine_forward(
+        send_ptr: float*[local_expert_cnt, max_send_tokens, hidden_size],
+        recv_ptr: float*[local_expert_cnt, max_recv_tokens, hidden_size],
+        ibgda_ptr: void*,
+        hidden_size: int,
+        rank: int,
+        world_size: int,
+        local_expert_cnt: int,
+        topk: int,
+        max_send_tokens: int,
+        send_layout_ptr: layout_t*[world_size, local_expert_cnt],
+        recv_layout_ptr: layout_t*[world_size, local_expert_cnt],
+        float_config: FloatConfig,
+        config: Config
+    )
+
+【算法】
+    # 公共逻辑：
+    parallel_for expert_id in range(local_expert_cnt):
+        parallel_for peer_rank in range(world_size):
+            if peer_rank == rank:
+                continue
+
+            send_layout = send_layout_ptr[peer_rank, expert_id]
+            recv_layout = recv_layout_ptr[peer_rank, expert_id]
+
+            send_data = send_ptr + expert_id * max_tokens * hidden_size + send_layout.data_offset * hidden_size
+            recv_data = recv_ptr + expert_id * max_tokens * hidden_size + recv_layout.data_offset * hidden_size
+
+            # dispatch 特有：
+            if is_dispatch:
+                send_cnt = send_layout.cnt
+                recv_cnt = recv_layout.cnt if num_worst_tokens == 0 else min(num_worst_tokens, recv_layout.cnt)
+
+            # combine 特有：
+            if is_combine:
+                send_cnt = send_layout.cnt
+                recv_cnt = recv_layout.cnt
+
+            # 双向通信：
+            ibgda_send_recv(ibgda_ptr, send_data, send_cnt, recv_data, recv_cnt, 
+                          hidden_size, peer_rank, expert_id, float_config, config)
+
+【并行模式】
+    grid: (local_expert_cnt, world_size - 1)
+    block: 由 config 指定，一般 (warp_size * warps_per_block)
+
+    优化:
+    - 每个 block 处理一对 (expert, peer_rank) 的双向通信
+    - 使用 NVSHMEM 的 ibgda_send_recv 实现 RDMA 通信
+    - dispatch 支持 num_worst_tokens 限制接收量（用于 CUDA Graph）
+
+【备注】
+    - ibgda_send_recv: NVSHMEM 设备端双向传输，见 ibgda_device.cuh
+    - layout_t: 包含 cnt（token数）、data_offset（缓冲区偏移）
+    - FloatConfig: FP8/BF16 精度配置
+    - Config: 包含 warps_per_block 等内核配置
+    - max_tokens: dispatch 用 max_send_tokens，combine 用 max_recv_tokens

@@ -1,0 +1,176 @@
+{
+  "version": 1,
+  "units": {
+    "deep_ep": {
+      "type": "group",
+      "hashes": {
+        "deep_ep.cpp": "ae1e784d8dea2f39",
+        "deep_ep.hpp": "5e4c41d61be01767"
+      },
+      "tasks": {
+        "purpose": "done",
+        "pseudocode": "done"
+      }
+    },
+    "CMakeLists.txt": {
+      "type": "file",
+      "hashes": {
+        "CMakeLists.txt": "ba87d5db7c544433"
+      },
+      "tasks": {
+        "purpose": "done",
+        "pseudocode": "done"
+      }
+    },
+    "kernels/api.cuh": {
+      "type": "file",
+      "hashes": {
+        "kernels/api.cuh": "b39fd15e93db6e81"
+      },
+      "tasks": {
+        "purpose": "done",
+        "pseudocode": "done"
+      }
+    },
+    "kernels/CMakeLists.txt": {
+      "type": "file",
+      "hashes": {
+        "kernels/CMakeLists.txt": "64b8dfe1c2b60870"
+      },
+      "tasks": {
+        "purpose": "done",
+        "pseudocode": "done"
+      }
+    },
+    "kernels/exception.cuh": {
+      "type": "file",
+      "hashes": {
+        "kernels/exception.cuh": "acdd9fc736bb82f4"
+      },
+      "tasks": {
+        "purpose": "done",
+        "pseudocode": "done"
+      }
+    },
+    "kernels/launch.cuh": {
+      "type": "file",
+      "hashes": {
+        "kernels/launch.cuh": "7bfe645d035a4a2f"
+      },
+      "tasks": {
+        "purpose": "done",
+        "pseudocode": "done"
+      }
+    },
+    "kernels/buffer.cuh": {
+      "type": "file",
+      "hashes": {
+        "kernels/buffer.cuh": "0989c3b6aa772e31"
+      },
+      "tasks": {
+        "purpose": "done",
+        "pseudocode": "done"
+      }
+    },
+    "kernels/utils.cuh": {
+      "type": "file",
+      "hashes": {
+        "kernels/utils.cuh": "917179d9cb5ec986"
+      },
+      "tasks": {
+        "purpose": "done",
+        "pseudocode": "done"
+      }
+    },
+    "kernels/configs.cuh": {
+      "type": "file",
+      "hashes": {
+        "kernels/configs.cuh": "ebc05839918ab511"
+      },
+      "tasks": {
+        "purpose": "done",
+        "pseudocode": "done"
+      }
+    },
+    "event.hpp": {
+      "type": "file",
+      "hashes": {
+        "event.hpp": "565091cb35ce1050"
+      },
+      "tasks": {
+        "purpose": "done",
+        "pseudocode": "done"
+      }
+    },
+    "config.hpp": {
+      "type": "file",
+      "hashes": {
+        "config.hpp": "559844984a050b03"
+      },
+      "tasks": {
+        "purpose": "done",
+        "pseudocode": "done"
+      }
+    },
+    "kernels/runtime.cu": {
+      "type": "file",
+      "hashes": {
+        "kernels/runtime.cu": "4e3f8a8c7461430b"
+      },
+      "tasks": {
+        "purpose": "done",
+        "pseudocode": "done"
+      }
+    },
+    "kernels/layout.cu": {
+      "type": "file",
+      "hashes": {
+        "kernels/layout.cu": "be5b350850305b05"
+      },
+      "tasks": {
+        "purpose": "done",
+        "pseudocode": "done"
+      }
+    },
+    "kernels/ibgda_device.cuh": {
+      "type": "file",
+      "hashes": {
+        "kernels/ibgda_device.cuh": "458edaed2ca2bdaa"
+      },
+      "tasks": {
+        "purpose": "done",
+        "pseudocode": "done"
+      }
+    },
+    "kernels/intranode.cu": {
+      "type": "file",
+      "hashes": {
+        "kernels/intranode.cu": "6a6a773a1b86fc18"
+      },
+      "tasks": {
+        "purpose": "done",
+        "pseudocode": "done"
+      }
+    },
+    "kernels/internode_ll.cu": {
+      "type": "file",
+      "hashes": {
+        "kernels/internode_ll.cu": "9ee7895e83241260"
+      },
+      "tasks": {
+        "purpose": "done",
+        "pseudocode": "done"
+      }
+    },
+    "kernels/internode.cu": {
+      "type": "file",
+      "hashes": {
+        "kernels/internode.cu": "5dfdf9ab17c394d6"
+      },
+      "tasks": {
+        "purpose": "done",
+        "pseudocode": "done"
+      }
+    }
+  }
+}

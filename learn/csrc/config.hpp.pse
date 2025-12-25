@@ -1,0 +1,225 @@
+# config.hpp 伪代码
+
+---
+
+## 工具函数
+
+```
+--------------------------------
+数学工具函数
+来源: csrc/config.hpp
+--------------------------------
+
+【函数】
+    ceil_div<T>(a: T, b: T) -> T
+        用途: 向上整除，计算 ⌈a/b⌉
+
+    align_up<T>(a: T, b: T) -> T
+        用途: 向上对齐到 b 的倍数
+
+    align_down<T>(a: T, b: T) -> T
+        用途: 向下对齐到 b 的倍数
+```
+
+---
+
+## 配置结构
+
+```
+--------------------------------
+Config (通信配置)
+来源: csrc/config.hpp
+--------------------------------
+
+【状态】
+    num_sms: int                             # SM (Streaming Multiprocessor) 数量
+    num_max_nvl_chunked_send_tokens: int     # NVLink 分块发送最大 token 数
+    num_max_nvl_chunked_recv_tokens: int     # NVLink 分块接收最大 token 数
+    num_max_rdma_chunked_send_tokens: int    # RDMA 分块发送最大 token 数
+    num_max_rdma_chunked_recv_tokens: int    # RDMA 分块接收最大 token 数
+
+【接口】
+    Config(num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
+           num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens)
+        参数: 初始化上述5个字段
+        用途: 构造配置对象
+        约束:
+            - num_sms >= 0
+            - num_max_nvl_chunked_send_tokens > 0 && num_max_nvl_chunked_recv_tokens > 0
+            - num_max_nvl_chunked_send_tokens < num_max_nvl_chunked_recv_tokens
+            - num_max_rdma_chunked_send_tokens > 0 && num_max_rdma_chunked_recv_tokens > 0
+            - num_max_rdma_chunked_send_tokens <= num_max_rdma_chunked_recv_tokens / 2  # RDMA lazy head update 约束
+        副作用:
+            - 将 num_max_rdma_chunked_recv_tokens 向上对齐到 num_max_rdma_chunked_send_tokens 的倍数
+
+    get_nvl_buffer_size_hint(hidden_bytes: size_t, num_ranks: int) -> size_t
+        用途: 计算 NVLink buffer 推荐大小
+        约束:
+            - num_ranks < NUM_MAX_NVL_PEERS 或 num_ranks % NUM_MAX_NVL_PEERS == 0
+            - num_ranks > NUM_MAX_NVL_PEERS 时，num_sms % 2 == 0
+        算法:
+            num_rdma_ranks = max(num_ranks / NUM_MAX_NVL_PEERS, 1)
+            num_nvl_ranks = min(num_ranks, NUM_MAX_NVL_PEERS)
+            num_channels = num_sms / 2
+            
+            bytes = 0
+            bytes += num_channels * num_nvl_ranks * (2*num_rdma_ranks + 3) * sizeof(int)  # 控制信息
+            bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * hidden_bytes  # 隐藏层数据
+            bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * internode::get_source_meta_bytes()  # 元数据
+            bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * kNumMaxTopK * (sizeof(topk_idx_t) + sizeof(float))  # topk 索引+值
+            bytes += num_channels * num_nvl_ranks * num_max_nvl_chunked_recv_tokens * kNumMaxScales * sizeof(float)  # scales
+            return align_up(bytes, 128)
+
+    get_rdma_buffer_size_hint(hidden_bytes: int64, num_ranks: int) -> size_t
+        用途: 计算 RDMA buffer 推荐大小
+        约束:
+            - num_ranks % NUM_MAX_NVL_PEERS == 0
+            - num_sms % 2 == 0
+        算法:
+            if num_ranks <= NUM_MAX_NVL_PEERS:
+                return 0  # Legacy mode 不需要 RDMA buffer
+            
+            num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS
+            num_channels = num_sms / 2
+            
+            bytes = 0
+            bytes += num_channels * num_rdma_ranks * (NUM_MAX_NVL_PEERS*2 + 2) * 2 * sizeof(int)  # 控制信息 (双缓冲)
+            bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * hidden_bytes * 2  # 数据 (双缓冲)
+            bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * internode::get_source_meta_bytes() * 2
+            bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * kNumMaxTopK * (sizeof(topk_idx_t) + sizeof(float)) * 2
+            bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * kNumMaxScales * sizeof(float) * 2
+            bytes += num_channels * num_rdma_ranks * num_max_rdma_chunked_recv_tokens * sizeof(int4) * 2  # 额外控制信息
+            return align_up(bytes, 128)
+
+【常量】
+    kNumMaxTopK = 128      # 最大 topk 数量
+    kNumMaxScales = 128    # 最大 scales 数量
+
+【依赖】
+    internode::get_source_meta_bytes()   # 获取 internode 元数据大小
+    NUM_MAX_NVL_PEERS                    # NVLink 最大对等节点数
+    NUM_BUFFER_ALIGNMENT_BYTES           # Buffer 对齐字节数
+```
+
+---
+
+## 低延迟通信结构
+
+```
+--------------------------------
+LowLatencyBuffer (低延迟 buffer 指针集合)
+来源: csrc/config.hpp
+--------------------------------
+
+【状态】
+    num_clean_int: int                              # 需要清理的 int 数量
+    
+    # Dispatch 阶段
+    dispatch_rdma_send_buffer: void*                # RDMA 发送 buffer
+    dispatch_rdma_recv_data_buffer: void*           # RDMA 接收数据 buffer
+    dispatch_rdma_recv_count_buffer: int*           # RDMA 接收计数 buffer
+    
+    # Combine 阶段
+    combine_rdma_send_buffer: void*                 # RDMA 发送 buffer
+    combine_rdma_recv_data_buffer: void*            # RDMA 接收数据 buffer
+    combine_rdma_recv_flag_buffer: int*             # RDMA 接收标志 buffer
+    
+    # 辅助字段
+    combine_rdma_send_buffer_data_start: void*      # Combine 发送数据起始位置
+    num_bytes_per_combine_msg: size_t               # 每个 combine 消息字节数
+
+【接口】
+    clean_meta() -> (int*, int)
+        用途: 获取需要清理的元数据指针和数量
+        约束: dispatch_rdma_recv_count_buffer == combine_rdma_recv_flag_buffer
+        返回: (buffer指针, num_clean_int)
+```
+
+```
+--------------------------------
+LowLatencyLayout (低延迟 buffer 布局管理)
+来源: csrc/config.hpp
+--------------------------------
+
+【状态】
+    total_bytes: size_t          # 总字节数
+    buffers[2]: LowLatencyBuffer # 双缓冲区 (odd/even)
+
+【接口】
+    LowLatencyLayout(rdma_buffer: void*, num_max_dispatch_tokens_per_rank: int,
+                     hidden: int, num_ranks: int, num_experts: int)
+        参数:
+            - rdma_buffer: RDMA buffer 基地址
+            - num_max_dispatch_tokens_per_rank: 每个 rank 最大 dispatch token 数
+            - hidden: 隐藏层维度
+            - num_ranks: rank 总数
+            - num_experts: expert 总数
+        用途: 初始化双缓冲区布局
+        约束:
+            - num_scales * sizeof(float) <= hidden  # scales 不超过 hidden size
+        
+        算法:
+            num_scales = hidden / 128
+            
+            # 计算消息大小
+            num_bytes_per_dispatch_msg = sizeof(int4) + max(hidden * sizeof(nv_bfloat16),
+                                                             hidden + num_scales * sizeof(float))
+            num_bytes_per_combine_msg = num_scales * sizeof(nv_bfloat162) + hidden * sizeof(nv_bfloat16)
+            
+            # 计算 buffer 大小
+            dispatch_send_buffer_bytes = num_max_dispatch_tokens_per_rank * num_bytes_per_dispatch_msg
+            combine_send_buffer_bytes = num_experts * num_max_dispatch_tokens_per_rank * num_bytes_per_combine_msg
+            send_buffer_bytes = max(dispatch_send_buffer_bytes, combine_send_buffer_bytes)
+            assert send_buffer_bytes % sizeof(int4) == 0
+            
+            dispatch_recv_data_buffer_bytes = num_experts * num_max_dispatch_tokens_per_rank * num_bytes_per_dispatch_msg
+            combine_recv_buffer_bytes = num_experts * num_max_dispatch_tokens_per_rank * num_bytes_per_combine_msg
+            recv_buffer_bytes = max(dispatch_recv_data_buffer_bytes, combine_recv_buffer_bytes)
+            assert recv_buffer_bytes % sizeof(int4) == 0
+            
+            dispatch_recv_count_buffer_bytes = num_experts * sizeof(int)
+            combine_recv_flag_buffer_bytes = dispatch_recv_count_buffer_bytes
+            signaling_buffer_bytes = max(dispatch_recv_count_buffer_bytes, combine_recv_flag_buffer_bytes)
+            signaling_buffer_bytes_aligned = align_up(signaling_buffer_bytes, 128)
+            
+            total_bytes = send_buffer_bytes * 2 + recv_buffer_bytes * 2 + signaling_buffer_bytes_aligned * 2
+            
+            # 布局：[signaling0][signaling1][send0][send1][recv0][recv1]
+            for i in [0, 1]:
+                buffers[i].num_clean_int = signaling_buffer_bytes / sizeof(int)
+                buffers[i].dispatch_rdma_send_buffer = rdma_buffer + signaling_aligned*2 + send_bytes*i
+                buffers[i].dispatch_rdma_recv_data_buffer = rdma_buffer + signaling_aligned*2 + send_bytes*2 + recv_bytes*i
+                buffers[i].dispatch_rdma_recv_count_buffer = rdma_buffer + signaling_aligned*i
+                buffers[i].combine_rdma_send_buffer = buffers[i].dispatch_rdma_send_buffer
+                buffers[i].combine_rdma_recv_data_buffer = buffers[i].dispatch_rdma_recv_data_buffer
+                buffers[i].combine_rdma_recv_flag_buffer = buffers[i].dispatch_rdma_recv_count_buffer
+                buffers[i].combine_rdma_send_buffer_data_start = buffers[i].combine_rdma_send_buffer
+                buffers[i].num_bytes_per_combine_msg = num_bytes_per_combine_msg
+
+    advance<out_ptr_t, count_ptr_t, in_ptr_t>(ptr: in_ptr_t, count: size_t) -> out_ptr_t
+        用途: 指针算术，将 ptr 前进 count 字节并转换为目标类型
+
+【备注】
+    - 布局设计：dispatch 和 combine 共享同一块 buffer，通过不同的起始偏移区分
+    - 双缓冲设计：奇偶交替使用，支持 pipeline 并行
+    - Buffer 对齐：所有 buffer 起始地址按 128 字节对齐
+```
+
+---
+
+## 全局工具函数
+
+```
+--------------------------------
+低延迟 RDMA 尺寸计算
+来源: csrc/config.hpp
+--------------------------------
+
+【函数】
+    get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int,
+                                    num_ranks: int, num_experts: int) -> size_t
+        用途: 计算低延迟模式 RDMA buffer 推荐大小
+        算法:
+            layout = LowLatencyLayout(nullptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
+            return align_up(layout.total_bytes, NUM_BUFFER_ALIGNMENT_BYTES)
+```

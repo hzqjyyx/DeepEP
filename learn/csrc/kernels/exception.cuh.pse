@@ -1,0 +1,60 @@
+# 错误处理与断言机制
+来源: csrc/kernels/exception.cuh
+
+---
+
+## EPException 类
+
+【状态】
+    message: string    # 错误信息字符串
+
+【接口】
+    EPException(name: const char*, file: const char*, line: int, error: string)
+        用途: 构造异常对象，拼接格式化错误信息
+        格式: "Failed: {name} error {file}:{line} '{error}'"
+
+    what() -> const char*
+        用途: 返回错误信息，符合 std::exception 接口
+
+---
+
+## 宏工具
+
+【宏】
+    EP_STATIC_ASSERT(cond, reason)
+        用途: 编译期断言
+        实现: static_assert(cond, reason)
+
+    CUDA_CHECK(cmd)
+        用途: 检查 CUDA Runtime API 调用结果
+        逻辑:
+            e = cmd
+            if e != cudaSuccess:
+                throw EPException("CUDA", __FILE__, __LINE__, cudaGetErrorString(e))
+
+    CU_CHECK(cmd)
+        用途: 检查 CUDA Driver API 调用结果
+        逻辑:
+            e = cmd
+            if e != CUDA_SUCCESS:
+                cuGetErrorString(e, &error_str)
+                throw EPException("CU", __FILE__, __LINE__, error_str)
+
+    EP_HOST_ASSERT(cond)
+        用途: Host 侧运行时断言
+        逻辑:
+            if not cond:
+                throw EPException("Assertion", __FILE__, __LINE__, #cond)
+
+    EP_DEVICE_ASSERT(cond)
+        用途: Device 侧运行时断言
+        逻辑:
+            if not cond:
+                printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, __LINE__, #cond)
+                asm("trap;")    # 触发 GPU trap 中断
+
+【备注】
+    - CUDA_CHECK 用于 cudaMemcpy 等 Runtime API
+    - CU_CHECK 用于 cuMemcpy 等 Driver API
+    - EP_DEVICE_ASSERT 会触发 GPU 中断，可能导致整个 kernel 失败
+    - 所有宏都使用 do-while(0) 包裹以确保语法安全

@@ -1,0 +1,67 @@
+# 构建配置文件：CUDA内核库
+
+---
+
+## 函数：add_deep_ep_library
+
+**用途**：统一构建 DeepEP CUDA 内核静态库的辅助函数
+
+**参数**：
+- `target_name`：目标库名称
+- `source_file`：CUDA 源文件路径
+
+**行为**：
+```cmake
+创建静态库 ${target_name}
+    源文件: ${source_file}
+    编译属性:
+        - 启用位置无关代码 (PIC)
+        - 要求 C++17 标准
+        - 要求 CUDA C++17 标准
+        - 启用 CUDA 分离编译
+
+    链接依赖:
+        - nvshmem      # NVSHMEM 库（跨节点通信）
+        - cudart       # CUDA 运行时
+        - cudadevrt    # CUDA 设备运行时（分离编译需要）
+        - mlx5         # Mellanox InfiniBand 驱动（RDMA）
+```
+
+---
+
+## 库构建清单
+
+```cmake
+# 运行时初始化与内存管理
+add_deep_ep_library(runtime_cuda, runtime.cu)
+
+# Token 布局计算
+add_deep_ep_library(layout_cuda, layout.cu)
+
+# NVLink 节点内通信
+add_deep_ep_library(intranode_cuda, intranode.cu)
+
+# RDMA 跨节点通信（正常模式）
+add_deep_ep_library(internode_cuda, internode.cu)
+
+# RDMA 跨节点通信（低延迟模式）
+add_deep_ep_library(internode_ll_cuda, internode_ll.cu)
+```
+
+---
+
+## 导出变量
+
+**作用域**：向父作用域导出库列表，供链接使用
+
+```cmake
+EP_CUDA_LIBRARIES = [
+    runtime_cuda,
+    layout_cuda,
+    intranode_cuda,
+    internode_cuda,
+    internode_ll_cuda
+]
+```
+
+**备注**：注释提示后续应链接此列表中的所有库
